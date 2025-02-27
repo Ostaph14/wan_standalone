@@ -25,20 +25,80 @@ from .utils.fm_solvers import (FlowDPMSolverMultistepScheduler,
                                get_sampling_sigmas, retrieve_timesteps)
 from .utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
+from safetensors import safe_open
+import os
+import json
+
+# Set higher log level
+os.environ["TORCH_DISTRIBUTED_DEBUG"] = "INFO"
+torch.set_printoptions(profile="full")
+
+# Add error handler for uncaught exceptions
+def handle_exception(exc_type, exc_value, exc_traceback):
+    import traceback
+    print("".join(traceback.format_exception(exc_type, exc_value, exc_traceback)))
+    # Force exit
+    os._exit(1)
+
+sys.excepthook = handle_exception
+
+
+# Monkey patch the from_pretrained method of WanModel
+original_from_pretrained = WanModel.from_pretrained
+
+from safetensors.torch import load_file
+# Create model with config or defaults
+from .modules.model import WanModel
+# Define a custom loader function for the quantized model
+def load_quantized_wan_model(checkpoint_dir, model_type='i2v'):
+
+    config_file = os.path.join(checkpoint_dir, "config.json")
+    if os.path.exists(config_file):
+        with open(config_file, 'r') as f:
+            import json
+            config = json.load(f)
+        model = WanModel(**config)
+    else:
+        model = WanModel(model_type=model_type)
+
+    # Load weights directly
+    quant_file = os.path.join(checkpoint_dir, "Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors")
+    if os.path.exists(quant_file):
+        # Log loading only from rank 0
+        if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+            print(f"Loading quantized model from {quant_file}")
+
+        # Load weights in a memory-efficient way
+        weights = {}
+        with torch.no_grad():
+            try:
+                weights = load_file(quant_file)
+                model.load_state_dict(weights, strict=False)
+                print("Loaded quantized weights successfully")
+            except Exception as e:
+                print(f"Error loading quantized weights: {e}")
+                print("Proceeding with uninitialized model")
+            finally:
+                # Ensure we clean up regardless of success/failure
+                if 'weights' in locals():
+                    del weights
+                torch.cuda.empty_cache()
+
+    return model
 
 class WanI2V:
 
     def __init__(
-            self,
-            config,
-            checkpoint_dir,
-            device_id=1,
-            rank=0,
-            t5_fsdp=False,
-            dit_fsdp=False,
-            use_usp=False,
-            t5_cpu=False,
-            init_on_cpu=True,
+        self,
+        config,
+        checkpoint_dir,
+        device_id=0,
+        rank=0,
+        t5_fsdp=False,
+        dit_fsdp=False,
+        use_usp=False,
+        t5_cpu=False,
+        init_on_cpu=True,
     ):
         r"""
         Initializes the image-to-video generation model components.
@@ -63,12 +123,7 @@ class WanI2V:
             init_on_cpu (`bool`, *optional*, defaults to True):
                 Enable initializing Transformer Model on CPU. Only works without FSDP or USP.
         """
-        primary_device = "cuda:0"
-        secondary_device = "cuda:1"
         self.device = torch.device(f"cuda:{device_id}")
-        self.primary_device = primary_device
-        self.secondary_device = secondary_device
-
         self.config = config
         self.rank = rank
         self.use_usp = use_usp
@@ -96,158 +151,16 @@ class WanI2V:
         self.clip = CLIPModel(
             dtype=config.clip_dtype,
             device=self.device,
-            checkpoint_path=os.path.join(checkpoint_dir, config.clip_checkpoint),
+            checkpoint_path=os.path.join(checkpoint_dir,
+                                         config.clip_checkpoint),
             tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer))
 
-        # Modified approach to load model across two GPUs
-        if not (t5_fsdp or dit_fsdp or use_usp):
-            logging.info(f"Creating split WanModel from {checkpoint_dir} across cuda:0 and cuda:1")
-            # Monkey patch the WanModel.from_pretrained method to load directly to distributed devices
-            original_from_pretrained = WanModel.from_pretrained
+        logging.info(f"Creating WanModel from {checkpoint_dir}")
+        self.model = load_quantized_wan_model(checkpoint_dir)
+        self.model.eval().requires_grad_(False)
 
-            def distributed_from_pretrained(cls, checkpoint_dir, **kwargs):
-                # First load model to CPU to analyze structure
-                # Correctly call the original method with just the right arguments
-                model = original_from_pretrained(checkpoint_dir, **kwargs)
-                model.eval().requires_grad_(False)
-
-                # Get number of blocks
-                total_blocks = len(model.blocks)
-                split_idx = total_blocks // 2
-
-                # Create a new distributed forward method
-                original_forward = model.forward
-
-                def custom_forward(self, x, t=None, context=None, clip_fea=None, seq_len=None, y=None):
-                    """Custom forward that handles device transitions"""
-                    # Ensure inputs are on the right device
-                    if isinstance(x, list):
-                        x_dev = [tensor.to(primary_device) for tensor in x]
-                    else:
-                        x_dev = x.to(primary_device)
-
-                    t_dev = t.to(primary_device) if t is not None else None
-
-                    if context is not None and isinstance(context, list):
-                        context_dev = [tensor.to(primary_device) for tensor in context]
-                    else:
-                        context_dev = context.to(primary_device) if context is not None else None
-
-                    clip_fea_dev = clip_fea.to(primary_device) if clip_fea is not None else None
-
-                    if y is not None and isinstance(y, list):
-                        y_dev = [tensor.to(primary_device) for tensor in y]
-                    else:
-                        y_dev = y.to(primary_device) if y is not None else None
-
-                    # Call the original forward with our device-specific versions
-                    # This is a partial forward pass we'll intercept with hooks
-                    result = original_forward(self, x_dev, t_dev, context_dev, clip_fea_dev, seq_len, y_dev)
-
-                    return result
-
-                # Replace forward method
-                model.forward = types.MethodType(custom_forward, model)
-
-                # Track execution flow through model
-                activation_dict = {}
-                hooks = []
-
-                # Capture input to first block on cuda:0
-                def pre_hook_first_block(module, input):
-                    activation_dict['first_block_input'] = input
-                    return input
-
-                # Capture output from last block on cuda:0
-                def hook_middle_block(module, input, output):
-                    activation_dict['middle_output'] = output
-                    # Transfer to cuda:1
-                    return output.to(secondary_device)
-
-                # Register hooks
-                hooks.append(model.blocks[0].register_forward_pre_hook(pre_hook_first_block))
-                hooks.append(model.blocks[split_idx - 1].register_forward_hook(hook_middle_block))
-
-                # Now distribute the model across devices
-                # First half of blocks to cuda:0
-                for i in range(split_idx):
-                    model.blocks[i] = model.blocks[i].to(primary_device)
-
-                # Second half of blocks to cuda:1
-                for i in range(split_idx, total_blocks):
-                    model.blocks[i] = model.blocks[i].to(secondary_device)
-
-                # Any remaining top-level components split based on dependency
-                # This requires model-specific knowledge
-                # For now, assuming the model has a simple structure where only blocks are important
-
-                # Clean up hooks after initialization
-                for hook in hooks:
-                    hook.remove()
-
-                return model
-
-            # Replace the from_pretrained method temporarily
-            WanModel.from_pretrained = classmethod(distributed_from_pretrained)
-
-            # Now create the model using our distributed loading
-            self.model = WanModel.from_pretrained(checkpoint_dir)
-
-            # Restore original method
-            WanModel.from_pretrained = original_from_pretrained
-
-            # Now create our custom forward implementation that handles the split
-            original_forward = self.model.forward
-
-            def distributed_forward(self, x, t=None, context=None, clip_fea=None, seq_len=None, y=None):
-                """Distributed forward pass implementation"""
-                # Process inputs on primary device
-                if isinstance(x, list):
-                    x_primary = [tensor.to(primary_device) for tensor in x]
-                else:
-                    x_primary = x.to(primary_device)
-
-                t_primary = t.to(primary_device) if t is not None else None
-
-                if context is not None and isinstance(context, list):
-                    context_primary = [tensor.to(primary_device) for tensor in context]
-                    context_secondary = [tensor.to(secondary_device) for tensor in context]
-                else:
-                    context_primary = context.to(primary_device) if context is not None else None
-                    context_secondary = context.to(secondary_device) if context is not None else None
-
-                clip_fea_primary = clip_fea.to(primary_device) if clip_fea is not None else None
-                y_primary = y[0].to(primary_device) if y is not None and isinstance(y, list) else y
-
-                # We need to capture intermediate state at the split point
-                activation_dict = {}
-
-                def hook_middle_block(module, input, output):
-                    activation_dict['middle_output'] = output
-                    # Transfer to cuda:1
-                    return output.to(secondary_device)
-
-                # Add hook to the last block in the first half
-                total_blocks = len(self.blocks)
-                split_idx = total_blocks // 2
-                hook = self.blocks[split_idx - 1].register_forward_hook(hook_middle_block)
-
-                # Run forward pass (will be intercepted by our hook)
-                result = original_forward(self, x_primary, t_primary, context_primary,
-                                          clip_fea_primary, seq_len, y_primary)
-
-                # Remove hook
-                hook.remove()
-
-                return result
-
-            # Replace forward with our distributed version
-            self.model.forward = types.MethodType(distributed_forward, self.model)
-        else:
-            # Standard loading for FSDP or USP
-            logging.info(f"Creating WanModel from {checkpoint_dir}")
-            self.model = WanModel.from_pretrained(checkpoint_dir)
-            self.model.eval().requires_grad_(False)
+        if t5_fsdp or dit_fsdp or use_usp:
+            init_on_cpu = False
 
         if use_usp:
             from xfuser.core.distributed import \
@@ -267,7 +180,9 @@ class WanI2V:
             dist.barrier()
         if dit_fsdp:
             self.model = shard_fn(self.model)
-        # We've handled model loading and distribution ourselves
+        else:
+            if not init_on_cpu:
+                self.model.to(self.device)
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
