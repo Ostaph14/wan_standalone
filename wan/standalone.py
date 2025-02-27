@@ -235,7 +235,8 @@ class WanVideoGenerator:
 
 		# Prepare block swapping
 		if blocks_to_swap > 0:
-			block_swap_args = {"blocks_to_swap": blocks_to_swap}
+			block_swap_args = None
+			#block_swap_args = {"blocks_to_swap": blocks_to_swap}
 		else:
 			block_swap_args = None
 
