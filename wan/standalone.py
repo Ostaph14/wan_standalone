@@ -1168,7 +1168,7 @@ def main():
 		vae_precision="bf16",
 		t5_precision="bf16",
 		clip_precision="fp16",
-		quantization="fp8_e4m3fn_fast",  # Use our custom FP8 implementation
+		quantization="fp8_e4m3fn",  # Use our custom FP8 implementation
 		attention_mode="sdpa",
 		blocks_to_swap=args.blocks_to_swap,
 		positive_prompt=args.positive_prompt,
