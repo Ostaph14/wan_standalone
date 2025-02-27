@@ -43,48 +43,136 @@ def handle_exception(exc_type, exc_value, exc_traceback):
 sys.excepthook = handle_exception
 
 
-# Monkey patch the from_pretrained method of WanModel
-original_from_pretrained = WanModel.from_pretrained
-
 from safetensors.torch import load_file
 # Create model with config or defaults
 from .modules.model import WanModel
 # Define a custom loader function for the quantized model
 def load_quantized_wan_model(checkpoint_dir, model_type='i2v'):
+    """Load the quantized model with explicit dimensions to match the weights"""
+    import psutil  # Add this import
 
-    config_file = os.path.join(checkpoint_dir, "config.json")
-    if os.path.exists(config_file):
-        with open(config_file, 'r') as f:
-            import json
-            config = json.load(f)
-        model = WanModel(**config)
-    else:
-        model = WanModel(model_type=model_type)
+    # Get local rank for logging
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 
-    # Load weights directly
+    # Debug memory usage
+    if local_rank == 0:
+        print(f"Memory before model creation: {psutil.Process().memory_info().rss / 1024 ** 3:.2f} GB")
+
+    # Create model with explicit dimensions matching the quantized weights
+    model = WanModel(
+        model_type='i2v',
+        in_dim=36,  # Match input tensor channels
+        dim=5120,  # Hidden dimension
+        ffn_dim=13824,  # FFN dimension
+        out_dim=16,  # Output channels
+        num_layers=40,  # Match layer count
+        # Keep other params default
+    )
+
+    if local_rank == 0:
+        print(f"Memory after model creation: {psutil.Process().memory_info().rss / 1024 ** 3:.2f} GB")
+
+    # Load weights with chunking to reduce memory usage
     quant_file = os.path.join(checkpoint_dir, "Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors")
     if os.path.exists(quant_file):
-        # Log loading only from rank 0
-        if int(os.environ.get("LOCAL_RANK", "0")) == 0:
-            print(f"Loading quantized model from {quant_file}")
+        if local_rank == 0:
+            print(f"Loading from: {quant_file}")
 
-        # Load weights in a memory-efficient way
-        weights = {}
-        with torch.no_grad():
+        # Use chunk-based loading to minimize memory usage
+        from safetensors import safe_open
+        model_state = model.state_dict()
+
+        # Group parameters by block for efficient loading
+        param_groups = {}
+        for name in model_state.keys():
+            parts = name.split('.')
+            if parts[0] == 'blocks' and len(parts) > 1:
+                group = f"blocks.{parts[1]}"
+            else:
+                group = "base"
+
+            if group not in param_groups:
+                param_groups[group] = []
+            param_groups[group].append(name)
+
+        # Load parameter groups
+        total_groups = len(param_groups)
+        for i, (group, params) in enumerate(param_groups.items()):
+            if local_rank == 0 and i % 10 == 0:
+                print(f"Loading group {i + 1}/{total_groups}: {group}")
+                print(f"Current memory: {psutil.Process().memory_info().rss / 1024 ** 3:.2f} GB")
+
             try:
-                weights = load_file(quant_file)
-                model.load_state_dict(weights, strict=False)
-                print("Loaded quantized weights successfully")
+                # Load just this group's parameters
+                with safe_open(quant_file, framework="pt", device="cpu") as f:
+                    for param_name in params:
+                        if param_name in f.keys():
+                            tensor = f.get_tensor(param_name)
+                            if tensor.shape == model_state[param_name].shape:
+                                model_state[param_name].copy_(tensor)
             except Exception as e:
-                print(f"Error loading quantized weights: {e}")
-                print("Proceeding with uninitialized model")
-            finally:
-                # Ensure we clean up regardless of success/failure
-                if 'weights' in locals():
-                    del weights
-                torch.cuda.empty_cache()
+                print(f"Error loading group {group}: {e}")
+
+            # Force cleanup after each group
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        if local_rank == 0:
+            print(f"Memory after loading: {psutil.Process().memory_info().rss / 1024 ** 3:.2f} GB")
 
     return model
+
+
+# First, inspect the shard_model function - this is likely causing our issues
+# Add this function at the top of the file to override FSDP settings
+from torch.distributed.fsdp import FullyShardedDataParallel, MixedPrecision
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+import functools
+
+def create_fsdp_model(model, device_id):
+    """Create a properly configured FSDP model that works across PyTorch versions"""
+    import torch.distributed.fsdp as fsdp
+    from torch.distributed.fsdp import FullyShardedDataParallel, MixedPrecision
+    from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy, default_auto_wrap_policy
+
+    # Define which layers to wrap
+    from .modules.model import WanAttentionBlock
+
+    # Create auto_wrap_policy (compatible with different PyTorch versions)
+    auto_wrap_policy = default_auto_wrap_policy
+    if hasattr(transformer_auto_wrap_policy, "__call__"):
+        # For newer PyTorch versions
+        auto_wrap_policy = transformer_auto_wrap_policy(
+            transformer_layer_cls={WanAttentionBlock},
+        )
+    else:
+        # For older PyTorch versions
+        auto_wrap_policy = functools.partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={WanAttentionBlock},
+        )
+
+    # Mixed precision config
+    mp_policy = MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        buffer_dtype=torch.bfloat16
+    )
+
+    # Wrapped model with proper FSDP parameters
+    fsdp_model = FullyShardedDataParallel(
+        model,
+        device_id=device_id,
+        mixed_precision=mp_policy,
+        auto_wrap_policy=auto_wrap_policy,  # Apply policy here instead
+        limit_all_gathers=True,
+        use_orig_params=False,
+        sync_module_states=True,
+        forward_prefetch=True,
+        backward_prefetch=True,
+    )
+
+    return fsdp_model
 
 class WanI2V:
 
@@ -146,22 +234,76 @@ class WanI2V:
         self.patch_size = config.patch_size
         self.vae = WanVAE(
             vae_pth=os.path.join(checkpoint_dir, config.vae_checkpoint),
-            device=self.device)
+            device="cpu")
 
         self.clip = CLIPModel(
             dtype=config.clip_dtype,
-            device=self.device,
+            device="cpu",
             checkpoint_path=os.path.join(checkpoint_dir,
                                          config.clip_checkpoint),
             tokenizer_path=os.path.join(checkpoint_dir, config.clip_tokenizer))
 
         logging.info(f"Creating WanModel from {checkpoint_dir}")
-        self.model = load_quantized_wan_model(checkpoint_dir)
+        if dit_fsdp:
+            # Skip FSDP and use a simpler approach that will work reliably
+            if self.rank == 0:
+                print("Creating model with correct dimensions (skipping FSDP)")
+
+            # Create model with correct parameters
+            self.model = WanModel(
+                model_type='i2v',
+                in_dim=36,
+                dim=5120,
+                ffn_dim=13824,
+                out_dim=16,
+                num_layers=40,
+            )
+
+            # Convert to half precision for memory efficiency
+            self.model = self.model.half()
+
+            if self.rank == 0:
+                print("Loading weights directly")
+
+            # Load weights directly
+            quant_file = os.path.join(checkpoint_dir, "Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors")
+
+            # Load weights efficiently
+            try:
+                from safetensors.torch import load_file
+                weights = load_file(quant_file)
+
+                # Convert to half precision
+                for k in weights:
+                    weights[k] = weights[k].half()
+
+                self.model.load_state_dict(weights, strict=False)
+
+                if self.rank == 0:
+                    print("Successfully loaded weights")
+
+            except Exception as e:
+                if self.rank == 0:
+                    print(f"Error loading weights: {e}")
+
+            # Move to device
+            if not init_on_cpu:
+                if self.rank == 0:
+                    print(f"Moving model to {self.device}")
+                self.model.to(self.device)
+                if self.rank == 0:
+                    print("Model successfully moved to device")
+        else:
+            # Normal loading for non-FSDP
+            self.model = load_quantized_wan_model(checkpoint_dir)
+        if self.rank == 0:
+            print("Model loaded, setting to eval mode")
         self.model.eval().requires_grad_(False)
 
         if t5_fsdp or dit_fsdp or use_usp:
             init_on_cpu = False
-
+        if self.rank == 0:
+            print("Configuring distributed setup")
         if use_usp:
             from xfuser.core.distributed import \
                 get_sequence_parallel_world_size
@@ -176,13 +318,21 @@ class WanI2V:
         else:
             self.sp_size = 1
 
-        if dist.is_initialized():
-            dist.barrier()
+        if self.rank == 0:
+            print("Before moving to device")
         if dit_fsdp:
+            if self.rank == 0:
+                print("Applying FSDP sharding")
             self.model = shard_fn(self.model)
+            if self.rank == 0:
+                print("FSDP sharding complete")
         else:
             if not init_on_cpu:
+                if self.rank == 0:
+                    print(f"Moving model to {self.device}")
                 self.model.to(self.device)
+                if self.rank == 0:
+                    print("Model successfully moved to device")
 
         self.sample_neg_prompt = config.sample_neg_prompt
 
@@ -234,6 +384,13 @@ class WanI2V:
                 - H: Frame height (from max_area)
                 - W: Frame width from max_area)
         """
+
+        # Add at the top of the method:
+        import psutil
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+
+        if local_rank == 0:
+            print(f"Starting generation with memory: {psutil.Process().memory_info().rss / 1024 ** 3:.2f} GB")
         img = TF.to_tensor(img).sub_(0.5).div_(0.5).to(self.device)
 
         F = frame_num
@@ -252,6 +409,7 @@ class WanI2V:
             self.patch_size[1] * self.patch_size[2])
         max_seq_len = int(math.ceil(max_seq_len / self.sp_size)) * self.sp_size
 
+        # seeding random noise
         seed = seed if seed >= 0 else random.randint(0, sys.maxsize)
         seed_g = torch.Generator(device=self.device)
         seed_g.manual_seed(seed)
@@ -264,6 +422,7 @@ class WanI2V:
             generator=seed_g,
             device=self.device)
 
+        # creating mask
         msk = torch.ones(1, 81, lat_h, lat_w, device=self.device)
         msk[:, 1:] = 0
         msk = torch.concat([
@@ -276,7 +435,12 @@ class WanI2V:
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
 
-        # preprocess
+            # After creating tensors and before model inference:
+            if local_rank == 0:
+                print(f"Input shapes: noise={noise.shape}, msk={msk.shape}, y={y.shape}")
+                print(f"Memory before inference: {psutil.Process().memory_info().rss / 1024 ** 3:.2f} GB")
+
+        # preprocess, y creation
         if not self.t5_cpu:
             self.text_encoder.model.to(self.device)
             context = self.text_encoder([input_prompt], self.device)
@@ -304,6 +468,11 @@ class WanI2V:
                          dim=1).to(self.device)
         ])[0]
         y = torch.concat([msk, y])
+
+        # After creating tensors and before model inference
+        if local_rank == 0:
+            print(f"Input shapes: noise={noise.shape}, msk={msk.shape}, y={y.shape}")
+            print(f"Memory before inference: {psutil.Process().memory_info().rss / 1024 ** 3:.2f} GB")
 
         @contextmanager
         def noop_no_sync():
@@ -335,6 +504,7 @@ class WanI2V:
             else:
                 raise NotImplementedError("Unsupported solver.")
 
+
             # sample videos
             latent = noise
 
@@ -357,6 +527,9 @@ class WanI2V:
 
             self.model.to(self.device)
             for _, t in enumerate(tqdm(timesteps)):
+                # Inference loop
+                if local_rank == 0 and t % 5 == 0:
+                    print(f"Step {t}/{len(timesteps)}, Memory: {psutil.Process().memory_info().rss / 1024 ** 3:.2f} GB")
                 latent_model_input = [latent.to(self.device)]
                 timestep = [t]
 
@@ -401,7 +574,11 @@ class WanI2V:
         if offload_model:
             gc.collect()
             torch.cuda.synchronize()
+        if self.rank == 0:
+            print("Before distributed barrier")
         if dist.is_initialized():
             dist.barrier()
+            if self.rank == 0:
+                print("After distributed barrier")
 
         return videos[0] if self.rank == 0 else None
