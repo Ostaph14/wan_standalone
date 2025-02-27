@@ -877,59 +877,21 @@ class WanVideoGenerator:
 	                   fps=16
 	                   ):
 		"""
-        Generate a video using the WanVideo model.
-
-        Args:
-            model_path: Path to the WanVideo model file
-            vae_path: Path to the VAE model file
-            t5_path: Path to the T5 text encoder file
-            clip_path: Path to the CLIP encoder file
-
-            base_precision: Precision for the main model (fp32, bf16, fp16)
-            vae_precision: Precision for the VAE
-            t5_precision: Precision for the T5 encoder
-            clip_precision: Precision for the CLIP encoder
-
-            positive_prompt: Text prompt for the video
-            negative_prompt: Negative text prompt
-
-            width: Output video width
-            height: Output video height
-            num_frames: Number of frames to generate
-
-            steps: Number of denoising steps
-            cfg: Classifier-free guidance scale
-            shift: Shift parameter for the scheduler
-            seed: Random seed (if None, a random seed will be generated)
-            scheduler: Sampling scheduler to use
-            riflex_freq_index: Frequency index for RIFLEX
-
-            quantization: Optional quantization method for the model
-            attention_mode: Attention implementation to use
-            blocks_to_swap: Number of blocks to swap to CPU for VRAM optimization
-            force_offload: Whether to offload models after use
-
-            enable_vae_tiling: Whether to use tiling for VAE decoding
-            tile_x, tile_y: Tile size for VAE
-            tile_stride_x, tile_stride_y: Tile stride for VAE
-
-            input_image: Optional input image for Image to Video (I2V)
-            noise_aug_strength: Strength of noise augmentation for I2V
-            latent_strength: Strength of latent multiplier for I2V
-            clip_embed_strength: Strength of CLIP embedding for I2V
-
-            input_video: Optional input video latents for Video to Video
-            denoise_strength: Strength of denoising for Video to Video
-
-            save_path: Path to save the output video
-            output_format: Format to save the video (mp4, gif, frames)
-            fps: Frames per second for the output video
-
-        Returns:
-            Generated video frames as a tensor and saves the video to disk if save_path is provided
-        """
+		Generate a video using the WanVideo model.
+		"""
 		print(f"Generating video...")
 		print(f"Prompt: {positive_prompt}")
+
+		# IMPORTANT FIX: Adjust num_frames to satisfy the model's requirement
+		# For the mask reshaping to work, (3 + num_frames) must be divisible by 4
+		# In other words, num_frames must be congruent to 1 modulo 4 (num_frames % 4 == 1)
+		original_num_frames = num_frames
+		while num_frames % 4 != 1:
+			num_frames += 1
+
+		if original_num_frames != num_frames:
+			print(
+				f"Adjusted num_frames from {original_num_frames} to {num_frames} to ensure compatibility with the model")
 
 		# Ensure we have aggressive memory cleanup
 		soft_empty_cache()
@@ -980,6 +942,9 @@ class WanVideoGenerator:
 			raise ValueError("No T5 encoder found. Please specify t5_path.")
 		if input_image is not None and clip_path is None:
 			raise ValueError("No CLIP encoder found for I2V. Please specify clip_path.")
+
+		# Rest of the method remains unchanged
+		# ...
 
 		# 1. Load all required models
 		print("Loading models...")
@@ -1070,6 +1035,11 @@ class WanVideoGenerator:
 		)
 
 		print(f"Video generated successfully! Shape: {video_frames.shape}")
+
+		# If original_num_frames is different from adjusted num_frames, trim the extra frames
+		if original_num_frames != num_frames and video_frames.shape[0] > original_num_frames:
+			video_frames = video_frames[:original_num_frames]
+			print(f"Trimmed output to requested {original_num_frames} frames")
 
 		# Save video if path is provided
 		if save_path:
