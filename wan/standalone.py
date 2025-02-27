@@ -104,7 +104,7 @@ class WanVideoGenerator:
         self.loaded_models = {}
 
     def load_model(self, model_path, base_precision="bf16", load_device="main_device",
-                   quantization="disabled", attention_mode="sdpa", blocks_to_swap=20):
+                   quantization="disabled", attention_mode="sdpa", blocks_to_swap=0):
         """
         Load the WanVideo transformer model.
 
@@ -768,7 +768,7 @@ class WanVideoGenerator:
                        # Resource optimization
                        quantization="disabled",
                        attention_mode="sdpa",
-                       blocks_to_swap=20,
+                       blocks_to_swap=0,
                        force_offload=True,
 
                        # VAE settings
