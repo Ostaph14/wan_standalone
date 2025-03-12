@@ -1093,7 +1093,7 @@ def main():
 	parser.add_argument("--num_frames", type=int, default=81, help="Number of frames to generate")
 	parser.add_argument("--steps", type=int, default=10, help="Number of sampling steps")
 	parser.add_argument("--cfg", type=float, default=6.0, help="Classifier-free guidance scale")
-	parser.add_argument("--shift", type=float, default=5.0, help="Scheduler shift parameter")
+	parser.add_argument("--shift", type=float, default=3.0, help="Scheduler shift parameter")
 	parser.add_argument("--seed", type=int, default=None, help="Random seed")
 	parser.add_argument("--scheduler", type=str, default="dpm++", choices=["dpm++", "dpm++_sde", "unipc"],
 	                    help="Sampling scheduler")
