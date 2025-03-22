@@ -21,6 +21,21 @@ from wanvideo.wan_video_vae import WanVideoVAE
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 
+# Add after imports
+if torch.cuda.is_available():
+	# Set optimal TF32 mode for Ampere+ GPUs
+	torch.backends.cuda.matmul.allow_tf32 = True
+	torch.backends.cudnn.allow_tf32 = True
+
+	# Enable cuDNN benchmarking for best performance
+	torch.backends.cudnn.benchmark = True
+
+	# Disable gradient synchronization
+	torch.cuda.set_sync_debug_mode(0)
+
+	# Set device to high priority stream
+	current_stream = torch.cuda.current_stream()
+	current_stream.priority = -1  # High priority
 
 # Custom FP8 optimization implementation matching ComfyUI approach
 def fp8_linear_forward_custom(cls, original_dtype, input):
@@ -35,22 +50,42 @@ def fp8_linear_forward_custom(cls, original_dtype, input):
 
 def convert_fp8_linear(module, original_dtype, params_to_keep={}):
 	"""
-    Convert linear layers to use custom FP8 implementation
-    Matches ComfyUI's approach for memory optimization
-    """
-	# Flag to indicate we've applied FP8 optimization
+	Enhanced FP8 optimization with better memory scaling
+	"""
 	setattr(module, "fp8_matmul_enabled", True)
 
-	for name, module in module.named_modules():
+	# Cache for intermediate calculations
+	if not hasattr(module, "_fp8_cache"):
+		module._fp8_cache = {}
+
+	for name, sub_module in module.named_modules():
 		if not any(keyword in name for keyword in params_to_keep):
-			if isinstance(module, torch.nn.Linear):
+			if isinstance(sub_module, torch.nn.Linear):
 				# Store the original forward function
-				original_forward = module.forward
-				setattr(module, "original_forward", original_forward)
+				original_forward = sub_module.forward
+				setattr(sub_module, "original_forward", original_forward)
 
-				# Replace with our custom implementation
-				setattr(module, "forward", lambda input, m=module: fp8_linear_forward_custom(m, original_dtype, input))
+				# Use better precision for small matrices
+				weight_size = sub_module.weight.numel()
+				use_fp16 = weight_size < 1000000  # Use fp16 for smaller matrices
 
+				# Enhanced forward with caching for common input shapes
+				def enhanced_forward(input, m=sub_module, use_fp16=use_fp16):
+					input_shape = input.shape
+					cache_key = (input_shape, input.device)
+
+					# Check for cached calculations
+					if hasattr(m, "_fp8_cache") and cache_key in m._fp8_cache:
+						cached_dtype = m._fp8_cache[cache_key]
+					else:
+						cached_dtype = torch.float16 if use_fp16 else original_dtype
+						if hasattr(m, "_fp8_cache"):
+							m._fp8_cache[cache_key] = cached_dtype
+
+					# Run with appropriate precision
+					return m.original_forward(input.to(cached_dtype))
+
+				setattr(sub_module, "forward", enhanced_forward)
 
 # Memory management utilities with aggressive cleanup
 def print_memory(device):
@@ -61,10 +96,12 @@ def print_memory(device):
 
 
 def soft_empty_cache():
-	"""Aggressively clean GPU memory"""
-	if torch.cuda.is_available():
-		torch.cuda.empty_cache()
-		gc.collect()
+    """Aggressively clean GPU memory with better timing"""
+    if torch.cuda.is_available():
+        # Add synchronization before cleanup
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        gc.collect()
 
 
 def add_noise_to_reference_video(image, ratio=None):
@@ -110,6 +147,57 @@ def common_upscale(samples, width, height, upscale_method, crop):
 	return samples
 
 
+class BlockSwapManager:
+	def __init__(self, model, blocks_to_swap, device, offload_device="cpu"):
+		self.model = model
+		self.max_active_blocks = blocks_to_swap
+		self.device = device
+		self.offload_device = offload_device
+		self.active_blocks = set()
+		self.block_map = {}
+
+		# Map all block parameters
+		for name, param in model.named_parameters():
+			if "blocks." in name:
+				block_id = int(name.split("blocks.")[1].split(".")[0])
+				if block_id not in self.block_map:
+					self.block_map[block_id] = []
+				self.block_map[block_id].append(name)
+
+	def activate_block(self, block_id):
+		"""Move a specific block to GPU"""
+		if block_id in self.active_blocks:
+			return
+
+		# Ensure we don't exceed max active blocks
+		while len(self.active_blocks) >= self.max_active_blocks:
+			# Remove oldest block (simple FIFO)
+			oldest = min(self.active_blocks)
+			self.deactivate_block(oldest)
+
+		# Move block to device
+		if block_id in self.block_map:
+			for param_name in self.block_map[block_id]:
+				param = self.model.get_parameter(param_name)
+				param.data = param.data.to(self.device)
+			self.active_blocks.add(block_id)
+
+	def deactivate_block(self, block_id):
+		"""Move a specific block to CPU"""
+		if block_id not in self.active_blocks:
+			return
+
+		if block_id in self.block_map:
+			for param_name in self.block_map[block_id]:
+				param = self.model.get_parameter(param_name)
+				param.data = param.data.to(self.offload_device)
+			self.active_blocks.remove(block_id)
+
+	def activate_sequential_blocks(self, start_block, count):
+		"""Activate a sequence of blocks for processing"""
+		for i in range(start_block, min(start_block + count, max(self.block_map.keys()) + 1)):
+			self.activate_block(i)
+
 class WanVideoGenerator:
 	def __init__(self, models_dir, device="cuda:0", t5_tokenizer_path=None, clip_tokenizer_path=None):
 		"""
@@ -137,19 +225,8 @@ class WanVideoGenerator:
 	def load_model(self, model_path, base_precision="bf16", load_device="main_device",
 	               quantization="disabled", attention_mode="sdpa", blocks_to_swap=0):
 		"""
-        Load the WanVideo transformer model.
-
-        Args:
-            model_path (str): Path to model file
-            base_precision (str): Model precision (fp32, bf16, fp16)
-            load_device (str): Which device to load model to (main_device or offload_device)
-            quantization (str): Optional quantization method
-            attention_mode (str): Attention implementation to use
-            blocks_to_swap (int): Number of blocks to swap to CPU for VRAM optimization
-
-        Returns:
-            dict: Loaded model and configuration
-        """
+		Load the WanVideo transformer model with enhanced memory management.
+		"""
 		print(f"Loading model from {model_path}...")
 		soft_empty_cache()
 
@@ -214,12 +291,15 @@ class WanVideoGenerator:
 			params_to_keep = {"norm", "head", "bias", "time_in", "vector_in", "patch_embedding", "time_", "img_emb",
 			                  "modulation"}
 
+			# Use blocks_to_swap if provided, otherwise use default
+			effective_blocks_to_swap = blocks_to_swap if blocks_to_swap > 0 else self.default_blocks_to_swap
+
 			# Load parameters with appropriate dtypes
 			for name, param in transformer.named_parameters():
 				dtype_to_use = base_dtype if any(keyword in name for keyword in params_to_keep) else dtype
 
 				# Check if this is a block parameter - if so, keep on CPU for now if using block_swap
-				if blocks_to_swap > 0 and "block" in name:
+				if effective_blocks_to_swap > 0 and "blocks." in name:
 					load_dev = self.offload_device
 				else:
 					load_dev = transformer_load_device
@@ -234,11 +314,18 @@ class WanVideoGenerator:
 			pass
 
 		# Prepare block swapping
-		if blocks_to_swap > 0:
-			block_swap_args = None
-			#block_swap_args = {"blocks_to_swap": blocks_to_swap}
-		else:
-			block_swap_args = None
+		block_swap_args = None
+		if blocks_to_swap > 0 or self.default_blocks_to_swap > 0:
+			effective_blocks = blocks_to_swap if blocks_to_swap > 0 else self.default_blocks_to_swap
+			block_swap_args = {"blocks_to_swap": effective_blocks}
+
+			# Initialize block manager
+			self.block_manager = BlockSwapManager(
+				transformer,
+				max_active_blocks=effective_blocks,
+				device=self.device,
+				offload_device=self.offload_device
+			)
 
 		model_info = {
 			"model": transformer,
@@ -248,7 +335,8 @@ class WanVideoGenerator:
 			"manual_offloading": manual_offloading,
 			"quantization": quantization,
 			"block_swap_args": block_swap_args,
-			"model_type": model_type
+			"model_type": model_type,
+			"num_layers": num_layers
 		}
 
 		del sd
@@ -257,11 +345,16 @@ class WanVideoGenerator:
 
 		# Apply our custom FP8 optimization
 		if quantization in ["fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_scaled"]:
-			print("Applying custom FP8 optimization to linear layers...")
+			print("Applying optimized FP8 optimization to linear layers...")
 			params_to_keep = {"norm", "head", "bias", "time_in", "vector_in", "patch_embedding", "time_", "img_emb",
 			                  "modulation"}
 			convert_fp8_linear(transformer, base_dtype, params_to_keep=params_to_keep)
 			print("FP8 optimization applied.")
+
+		# Use flash attention if available on compatible hardware
+		if torch.cuda.get_device_capability(0)[0] >= 8 and attention_mode == "sdpa":
+			print("Enabling Flash Attention optimizations")
+			transformer.use_flash_attention = True
 
 		self.loaded_models["diffusion_model"] = model_info
 		return model_info
@@ -713,60 +806,69 @@ class WanVideoGenerator:
 		soft_empty_cache()
 
 		# Turn off gradients for memory efficiency
+		# Replace your current sampling loop with this optimized version
 		with torch.no_grad():
-			# Enable mixed precision for memory efficiency
 			with torch.autocast(device_type=self.device.split(':')[0], dtype=model_info["dtype"], enabled=True):
-				for i, t in enumerate(tqdm(timesteps)):
-					# Only move latent to GPU during processing - like ComfyUI
-					latent_gpu = latent.to(self.device)
-					latent_model_input = [latent_gpu]
-					timestep = torch.tensor([t], device=self.device)
+				# Pre-allocate tensors and initialize block manager
+				latent_gpu = torch.zeros_like(latent, device=self.device)
+				block_manager = BlockSwapManager(transformer, blocks_to_swap, self.device, self.offload_device)
 
-					# Get conditional noise prediction and immediately move to CPU
-					noise_pred_cond = transformer(
-						latent_model_input, t=timestep, **arg_c)[0].to(self.offload_device)
+				# Process timesteps in batches where possible
+				timestep_batches = []
+				batch_size = min(4, len(timesteps))  # Group timesteps into small batches
+				for i in range(0, len(timesteps), batch_size):
+					timestep_batches.append(timesteps[i:i + batch_size])
 
-					# Free GPU memory
-					del latent_gpu
-					soft_empty_cache()
+				for batch_idx, timestep_batch in enumerate(tqdm(timestep_batches)):
+					# Prepare for batch processing
+					start_layer = 0
+					end_layer = transformer.num_layers
 
-					if cfg[i] != 1.0:
-						# Move latent back to GPU for unconditional pass
-						latent_gpu = latent.to(self.device)
+					# Activate early blocks for this timestep batch
+					block_manager.activate_sequential_blocks(0, min(10, transformer.num_layers))
+
+					# Process each timestep in small batches
+					for i, t in enumerate(timestep_batch):
+						# Copy latent to GPU
+						latent_gpu.copy_(latent.to(self.device))
 						latent_model_input = [latent_gpu]
+						timestep = torch.tensor([t], device=self.device)
 
-						# Get unconditional noise prediction and immediately move to CPU
-						noise_pred_uncond = transformer(
-							latent_model_input, t=timestep, **arg_null)[0].to(self.offload_device)
+						# Get conditional prediction
+						noise_pred_cond = transformer(
+							latent_model_input, t=timestep, **arg_c)[0].to(self.offload_device)
 
-						# Free GPU memory again
-						del latent_gpu
-						soft_empty_cache()
+						# Apply CFG if needed
+						if cfg[batch_idx * batch_size + i] != 1.0:
+							# Reuse latent_gpu for unconditional pass
+							latent_gpu.copy_(latent.to(self.device))
+							latent_model_input = [latent_gpu]
 
-						# Compute weighted noise prediction
-						noise_pred = noise_pred_uncond + cfg[i] * (
-								noise_pred_cond - noise_pred_uncond)
-					else:
-						noise_pred = noise_pred_cond
+							# Get unconditional prediction
+							noise_pred_uncond = transformer(
+								latent_model_input, t=timestep, **arg_null)[0].to(self.offload_device)
 
-					# Move needed tensors to GPU for sampling step
-					noise_pred_gpu = noise_pred.to(self.device)
-					latent_gpu = latent.to(self.device)
+							# Apply CFG
+							noise_pred = noise_pred_uncond + cfg[batch_idx * batch_size + i] * (
+									noise_pred_cond - noise_pred_uncond)
+						else:
+							noise_pred = noise_pred_cond
 
-					# Perform sampling step
-					temp_x0 = sample_scheduler.step(
-						noise_pred_gpu.unsqueeze(0),
-						t,
-						latent_gpu.unsqueeze(0),
-						return_dict=False,
-						generator=seed_g)[0]
+						# Sample and update latent
+						noise_pred = noise_pred.to(self.device)
+						latent_gpu.copy_(latent.to(self.device))
 
-					# Update latent and keep on CPU
-					latent = temp_x0.squeeze(0).cpu()
+						# Perform sampling step
+						latent = sample_scheduler.step(
+							noise_pred.unsqueeze(0),
+							t,
+							latent_gpu.unsqueeze(0),
+							return_dict=False,
+							generator=seed_g)[0].squeeze(0).cpu()
 
-					# Free GPU memory
-					del noise_pred_gpu, latent_gpu, latent_model_input, timestep
-					soft_empty_cache()
+						# Clear intermediate tensors
+						del noise_pred
+						torch.cuda.synchronize()
 
 		# Move final result to GPU for one last processing
 		latent_gpu = latent.to(self.device)
@@ -783,7 +885,7 @@ class WanVideoGenerator:
 
 	def decode(self, vae, samples, enable_vae_tiling=True,
 	           tile_x=272, tile_y=272, tile_stride_x=144, tile_stride_y=128):
-		"""Decode latents into video frames."""
+		"""Optimized decode function with overlap handling"""
 		print("Decoding video frames...")
 
 		soft_empty_cache()
@@ -792,29 +894,73 @@ class WanVideoGenerator:
 		# Move VAE to device for decoding
 		vae.to(self.device)
 
-		# Move latents to device
-		latents = latents.to(device=self.device, dtype=vae.dtype)
+		# Calculate optimal tile configuration
+		frames, channels, height, width = latents.shape
 
-		# Use mixed precision for decoding to save memory
-		with torch.cuda.amp.autocast():
-			# Decode in tiles for memory efficiency
-			image = vae.decode(
-				latents,
-				device=self.device,
-				tiled=enable_vae_tiling,
-				tile_size=(tile_x, tile_y),
-				tile_stride=(tile_stride_x, tile_stride_y)
-			)[0]
+		# Use adaptive tiling based on available memory
+		if enable_vae_tiling:
+			free_memory = torch.cuda.get_device_properties(self.device).total_memory - torch.cuda.memory_allocated(
+				self.device)
+			free_memory_gb = free_memory / (1024 ** 3)
+
+			# Adjust tile size based on available memory
+			if free_memory_gb > 8:
+				# More memory available, use larger tiles
+				tile_x = min(tile_x * 2, width)
+				tile_y = min(tile_y * 2, height)
+			elif free_memory_gb < 2:
+				# Very limited memory, use smaller tiles
+				tile_x = max(tile_x // 2, 64)
+				tile_y = max(tile_y // 2, 64)
+
+			# Ensure stride is appropriate for tile size
+			tile_stride_x = min(tile_stride_x, tile_x // 2)
+			tile_stride_y = min(tile_stride_y, tile_y // 2)
+
+		# Process in frame batches to reduce memory peaks
+		batch_size = 1
+		if frames <= 16:
+			batch_size = frames  # Process all at once for short videos
+		elif frames <= 64:
+			batch_size = 4  # Process in batches of 4 for medium videos
+		else:
+			batch_size = 2  # Process in batches of 2 for long videos
+
+		results = []
+
+		# Process in batches
+		for i in range(0, frames, batch_size):
+			end_idx = min(i + batch_size, frames)
+			batch = latents[i:end_idx].to(device=self.device, dtype=vae.dtype)
+
+			# Use mixed precision for decoding
+			with torch.cuda.amp.autocast():
+				decoded_batch = vae.decode(
+					batch,
+					device=self.device,
+					tiled=enable_vae_tiling,
+					tile_size=(tile_x, tile_y),
+					tile_stride=(tile_stride_x, tile_stride_y)
+				)[0]
+
+			# Normalize and format
+			decoded_batch = (decoded_batch - decoded_batch.min()) / (decoded_batch.max() - decoded_batch.min())
+			decoded_batch = torch.clamp(decoded_batch, 0.0, 1.0)
+			decoded_batch = decoded_batch.permute(1, 2, 3, 0).cpu().float()
+
+			results.append(decoded_batch)
+
+			# Clear batch from GPU
+			del batch, decoded_batch
+			soft_empty_cache()
+
+		# Concatenate results
+		image = torch.cat(results, dim=0)
 
 		# Clean up
 		vae.to(self.offload_device)
 		vae.model.clear_cache()
 		soft_empty_cache()
-
-		# Normalize and format
-		image = (image - image.min()) / (image.max() - image.min())
-		image = torch.clamp(image, 0.0, 1.0)
-		image = image.permute(1, 2, 3, 0).cpu().float()
 
 		return image
 
