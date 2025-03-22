@@ -1,5 +1,3 @@
-# Enhanced version with optimizations for faster inference
-
 import os
 import torch
 import gc
@@ -10,11 +8,6 @@ import argparse
 from PIL import Image
 import glob
 from safetensors.torch import load_file
-
-# Set optimal thread configuration for CPU operations
-torch.set_num_threads(os.cpu_count())
-os.environ["OMP_NUM_THREADS"] = str(os.cpu_count())
-os.environ["MKL_NUM_THREADS"] = str(os.cpu_count())
 
 # Import the WanVideo modules
 from wanvideo.modules.clip import CLIPModel
@@ -28,25 +21,13 @@ from wanvideo.wan_video_vae import WanVideoVAE
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 
-# Try to import flash attention if available
-try:
-	import flash_attn
 
-	HAS_FLASH_ATTN = True
-except ImportError:
-	HAS_FLASH_ATTN = False
-
-
-# Optimized FP8 linear forward with dynamic optimization if available
-def fp8_linear_forward_optimized(cls, original_dtype, input):
+# Custom FP8 optimization implementation matching ComfyUI approach
+def fp8_linear_forward_custom(cls, original_dtype, input):
 	"""
-	Optimized implementation of FP8 linear forward pass
-	"""
-	if hasattr(torch, "_dynamo") and torch.__version__ >= "2.0.0":
-		if not hasattr(cls, "optimized_forward"):
-			cls.optimized_forward = torch._dynamo.optimize("eager")(cls.original_forward)
-		return cls.optimized_forward(input.to(original_dtype))
-	elif hasattr(cls, "original_forward"):
+    Custom implementation of FP8 linear forward pass that follows ComfyUI's approach
+    """
+	if hasattr(cls, "original_forward"):
 		return cls.original_forward(input.to(original_dtype))
 	else:
 		return cls.forward(input.to(original_dtype))
@@ -54,8 +35,9 @@ def fp8_linear_forward_optimized(cls, original_dtype, input):
 
 def convert_fp8_linear(module, original_dtype, params_to_keep={}):
 	"""
-	Convert linear layers to use optimized FP8 implementation
-	"""
+    Convert linear layers to use custom FP8 implementation
+    Matches ComfyUI's approach for memory optimization
+    """
 	# Flag to indicate we've applied FP8 optimization
 	setattr(module, "fp8_matmul_enabled", True)
 
@@ -66,9 +48,8 @@ def convert_fp8_linear(module, original_dtype, params_to_keep={}):
 				original_forward = module.forward
 				setattr(module, "original_forward", original_forward)
 
-				# Replace with our optimized implementation
-				setattr(module, "forward",
-				        lambda input, m=module: fp8_linear_forward_optimized(m, original_dtype, input))
+				# Replace with our custom implementation
+				setattr(module, "forward", lambda input, m=module: fp8_linear_forward_custom(m, original_dtype, input))
 
 
 # Memory management utilities with aggressive cleanup
@@ -132,14 +113,14 @@ def common_upscale(samples, width, height, upscale_method, crop):
 class WanVideoGenerator:
 	def __init__(self, models_dir, device="cuda:0", t5_tokenizer_path=None, clip_tokenizer_path=None):
 		"""
-		Initialize the WanVideo generator.
+        Initialize the WanVideo generator.
 
-		Args:
-			models_dir (str): Directory containing model files
-			device (str): Device to use for computation (default: "cuda:0")
-			t5_tokenizer_path (str): Path to T5 tokenizer
-			clip_tokenizer_path (str): Path to CLIP tokenizer
-		"""
+        Args:
+            models_dir (str): Directory containing model files
+            device (str): Device to use for computation (default: "cuda:0")
+            t5_tokenizer_path (str): Path to T5 tokenizer
+            clip_tokenizer_path (str): Path to CLIP tokenizer
+        """
 		self.models_dir = models_dir
 		self.device = device
 
@@ -153,35 +134,27 @@ class WanVideoGenerator:
 		# Store loaded models
 		self.loaded_models = {}
 
-		# Pre-allocate buffers that can be reused
-		self.reusable_buffers = {}
-
 	def load_model(self, model_path, base_precision="bf16", load_device="main_device",
 	               quantization="disabled", attention_mode="sdpa", blocks_to_swap=0):
 		"""
-		Load the WanVideo transformer model.
+        Load the WanVideo transformer model.
 
-		Args:
-			model_path (str): Path to model file
-			base_precision (str): Model precision (fp32, bf16, fp16)
-			load_device (str): Which device to load model to (main_device or offload_device)
-			quantization (str): Optional quantization method
-			attention_mode (str): Attention implementation to use
-			blocks_to_swap (int): Number of blocks to swap to CPU for VRAM optimization
+        Args:
+            model_path (str): Path to model file
+            base_precision (str): Model precision (fp32, bf16, fp16)
+            load_device (str): Which device to load model to (main_device or offload_device)
+            quantization (str): Optional quantization method
+            attention_mode (str): Attention implementation to use
+            blocks_to_swap (int): Number of blocks to swap to CPU for VRAM optimization
 
-		Returns:
-			dict: Loaded model and configuration
-		"""
+        Returns:
+            dict: Loaded model and configuration
+        """
 		print(f"Loading model from {model_path}...")
 		soft_empty_cache()
 
 		# Set up devices and precision
 		transformer_load_device = self.device if load_device == "main_device" else self.offload_device
-
-		# Use Flash Attention if available
-		if HAS_FLASH_ATTN and attention_mode == "sdpa":
-			attention_mode = "flash_attention2"
-			print("Using Flash Attention 2 for faster inference")
 
 		# Map precision strings to PyTorch dtypes
 		base_dtype_map = {
@@ -262,27 +235,10 @@ class WanVideoGenerator:
 
 		# Prepare block swapping
 		if blocks_to_swap > 0:
-			block_swap_args = {"blocks_to_swap": blocks_to_swap}
+			block_swap_args = None
+			#block_swap_args = {"blocks_to_swap": blocks_to_swap}
 		else:
 			block_swap_args = None
-
-		# Apply torch.compile for significant speedup if PyTorch 2.0+ is available
-		if torch.__version__ >= "2.0.0" and hasattr(torch, "compile"):
-			print("Applying torch.compile optimization...")
-			try:
-				# Store uncompiled model for fallback
-				uncompiled_model = transformer
-
-				# Compile for maximum performance
-				transformer = torch.compile(
-					transformer,
-					mode="reduce-overhead",  # Try "max-autotune" for best performance but slower compilation
-					fullgraph=True
-				)
-				print("Model successfully compiled!")
-			except Exception as e:
-				print(f"Compilation failed: {e}. Using uncompiled model.")
-				transformer = uncompiled_model
 
 		model_info = {
 			"model": transformer,
@@ -292,8 +248,7 @@ class WanVideoGenerator:
 			"manual_offloading": manual_offloading,
 			"quantization": quantization,
 			"block_swap_args": block_swap_args,
-			"model_type": model_type,
-			"attention_mode": attention_mode
+			"model_type": model_type
 		}
 
 		del sd
@@ -328,32 +283,6 @@ class WanVideoGenerator:
 		vae.load_state_dict(vae_sd)
 		vae.eval()
 		vae.to(device=self.offload_device, dtype=dtype)
-
-		# Try to apply torch.compile to VAE if PyTorch 2.0+ is available
-		if torch.__version__ >= "2.0.0" and hasattr(torch, "compile"):
-			try:
-				# Store uncompiled VAE for fallback
-				uncompiled_vae = vae
-
-				# Encode and decode are the most critical functions to optimize
-				if hasattr(vae, "encode"):
-					vae.encode = torch.compile(
-						vae.encode,
-						mode="reduce-overhead",
-						fullgraph=False
-					)
-
-				if hasattr(vae, "decode"):
-					vae.decode = torch.compile(
-						vae.decode,
-						mode="reduce-overhead",
-						fullgraph=False
-					)
-
-				print("VAE functions successfully compiled!")
-			except Exception as e:
-				print(f"VAE compilation failed: {e}. Using uncompiled VAE.")
-				vae = uncompiled_vae
 
 		self.loaded_models["vae"] = vae
 		return vae
@@ -412,16 +341,10 @@ class WanVideoGenerator:
 		encoder = t5_encoder["model"]
 		dtype = t5_encoder["dtype"]
 
-		# Cache encoded prompts for reuse
-		prompt_key = f"{positive_prompt}_{negative_prompt}"
-		if hasattr(self, 'prompt_cache') and prompt_key in self.prompt_cache:
-			print("Using cached prompt embeddings")
-			return self.prompt_cache[prompt_key]
-
 		# Move encoder to device for processing
 		encoder.model.to(self.device)
 
-		with torch.no_grad(), torch.autocast(device_type=self.device.split(':')[0], dtype=dtype, enabled=True):
+		with torch.autocast(device_type=self.device.split(':')[0], dtype=dtype, enabled=True):
 			context = encoder([positive_prompt], self.device)
 			context_null = encoder([negative_prompt], self.device)
 
@@ -433,17 +356,10 @@ class WanVideoGenerator:
 			encoder.model.to(self.offload_device)
 			soft_empty_cache()
 
-		result = {
+		return {
 			"prompt_embeds": context,
 			"negative_prompt_embeds": context_null,
 		}
-
-		# Cache the result
-		if not hasattr(self, 'prompt_cache'):
-			self.prompt_cache = {}
-		self.prompt_cache[prompt_key] = result
-
-		return result
 
 	def encode_image_clip(self, clip, vae, image, num_frames, generation_width, generation_height,
 	                      force_offload=True, noise_aug_strength=0.0, latent_strength=1.0, clip_embed_strength=1.0):
@@ -520,17 +436,15 @@ class WanVideoGenerator:
 
 		# Process with CLIP and immediately offload
 		clip.model.to(self.device)
+		pixel_values = clip_preprocess(image.to(self.device), size=224, mean=image_mean, std=image_std,
+		                               crop=True).float()
 
-		with torch.no_grad():
-			pixel_values = clip_preprocess(image.to(self.device), size=224, mean=image_mean, std=image_std,
-			                               crop=True).float()
+		# Use CLIP to get embeddings
+		with torch.no_grad(), torch.cuda.amp.autocast():
+			clip_context = clip.visual(pixel_values)
 
-			# Use CLIP to get embeddings
-			with torch.cuda.amp.autocast():
-				clip_context = clip.visual(pixel_values)
-
-			if clip_embed_strength != 1.0:
-				clip_context *= clip_embed_strength
+		if clip_embed_strength != 1.0:
+			clip_context *= clip_embed_strength
 
 		# Immediately offload CLIP model
 		if force_offload:
@@ -548,17 +462,9 @@ class WanVideoGenerator:
 		h = lat_h * vae_stride[1]
 		w = lat_w * vae_stride[2]
 
-		# Create mask for I2V - optimize reuse of tensors when possible
-		if 'mask' in self.reusable_buffers and self.reusable_buffers['mask'].shape[1] >= num_frames:
-			# Reuse existing buffer
-			mask = self.reusable_buffers['mask'][:, :num_frames, :lat_h, :lat_w].clone()
-			mask.fill_(0)
-			mask[:, 0] = 1
-		else:
-			# Create new buffer
-			mask = torch.zeros(1, num_frames, lat_h, lat_w, device=self.device)
-			mask[:, 0] = 1
-			self.reusable_buffers['mask'] = mask
+		# Create mask for I2V
+		mask = torch.ones(1, num_frames, lat_h, lat_w, device=self.device)
+		mask[:, 1:] = 0
 
 		# Repeat first frame 4 times and concatenate with remaining frames
 		first_frame_repeated = torch.repeat_interleave(mask[:, 0:1], repeats=4, dim=1)
@@ -581,36 +487,36 @@ class WanVideoGenerator:
 		# Process through VAE
 		vae.to(self.device)
 
-		with torch.no_grad():
-			if isinstance(image, torch.Tensor):
-				if image.shape[-1] == 3:  # [B, H, W, C]
-					# Convert from [B, H, W, C] to [B, C, H, W]
-					img = image.permute(0, 3, 1, 2)
-				else:
-					img = image
+		if isinstance(image, torch.Tensor):
+			if image.shape[-1] == 3:  # [B, H, W, C]
+				# Convert from [B, H, W, C] to [B, C, H, W]
+				img = image.permute(0, 3, 1, 2)
 			else:
-				# Convert PIL image to tensor
-				img = torch.tensor(np.array(image).astype(np.float32) / 255.0).unsqueeze(0).permute(0, 3, 1, 2)
+				img = image
+		else:
+			# Convert PIL image to tensor
+			img = torch.tensor(np.array(image).astype(np.float32) / 255.0).unsqueeze(0).permute(0, 3, 1, 2)
 
-			# Resize to target dimensions
-			img = torch.nn.functional.interpolate(img, size=(h, w), mode="bicubic", align_corners=False)
-			# Convert to [-1, 1] range
-			img = img * 2 - 1
-			# Reshape to [C, B, H, W] format needed by the model
-			resized_image = img.squeeze(0).unsqueeze(1).to(self.device)  # Shape: [C, 1, H, W]
+		# Resize to target dimensions
+		img = torch.nn.functional.interpolate(img, size=(h, w), mode="bicubic", align_corners=False)
+		# Convert to [-1, 1] range
+		img = img * 2 - 1
+		# Reshape to [C, B, H, W] format needed by the model
+		resized_image = img.squeeze(0).unsqueeze(1).to(self.device)  # Shape: [C, 1, H, W]
 
-			if noise_aug_strength > 0.0:
-				resized_image = add_noise_to_reference_video(resized_image, ratio=noise_aug_strength)
+		if noise_aug_strength > 0.0:
+			resized_image = add_noise_to_reference_video(resized_image, ratio=noise_aug_strength)
 
-			# Create zero padding frames with correct shape
-			zero_frames = torch.zeros(3, num_frames - 1, h, w, device=self.device)
+		# Create zero padding frames with correct shape
+		zero_frames = torch.zeros(3, num_frames - 1, h, w, device=self.device)
 
-			# Use mixed precision encoding to save memory
-			with torch.cuda.amp.autocast():
-				concatenated = torch.concat([resized_image, zero_frames], dim=1).to(dtype=vae.dtype)
-				concatenated *= latent_strength
-				y = vae.encode([concatenated], self.device)[0]
-				y = torch.concat([mask, y])
+		# Now both tensors have compatible dimensions for concatenation
+		# Use mixed precision encoding to save memory
+		with torch.cuda.amp.autocast():
+			concatenated = torch.concat([resized_image, zero_frames], dim=1).to(dtype=vae.dtype)
+			concatenated *= latent_strength
+			y = vae.encode([concatenated], self.device)[0]
+			y = torch.concat([mask, y])
 
 		# Clear VAE cache and move back to offload device
 		vae.model.clear_cache()
@@ -651,8 +557,25 @@ class WanVideoGenerator:
 	           scheduler="dpm++", riflex_freq_index=0, force_offload=True,
 	           samples=None, denoise_strength=1.0):
 		"""
-		Run the sampling process to generate the video with optimized performance.
-		"""
+        Run the sampling process to generate the video.
+
+        Args:
+            model_info: The loaded diffusion model info
+            text_embeds: Encoded text prompts
+            image_embeds: Encoded image or empty embeds
+            shift: Shift parameter for the scheduler
+            steps: Number of denoising steps
+            cfg: Classifier-free guidance scale
+            seed: Random seed (if None, a random seed will be generated)
+            scheduler: Sampling scheduler to use
+            riflex_freq_index: Frequency index for RIFLEX
+            force_offload: Whether to offload models after use
+            samples: Initial latents for video2video
+            denoise_strength: Strength of denoising (for video2video)
+
+        Returns:
+            Generated video latents
+        """
 		print(f"Running sampling for {steps} steps with {scheduler} scheduler...")
 
 		if seed is None:
@@ -665,12 +588,12 @@ class WanVideoGenerator:
 		# Adjust steps based on denoise strength
 		steps = int(steps / denoise_strength)
 
-		# Initialize scheduler with optimized configuration
+		# Initialize scheduler
 		if scheduler == 'unipc':
 			sample_scheduler = FlowUniPCMultistepScheduler(
 				num_train_timesteps=1000,
 				shift=shift,
-				use_dynamic_shifting=True)  # Enable dynamic shifting
+				use_dynamic_shifting=False)
 			sample_scheduler.set_timesteps(
 				steps, device=self.device, shift=shift)
 			timesteps = sample_scheduler.timesteps
@@ -682,9 +605,8 @@ class WanVideoGenerator:
 			sample_scheduler = FlowDPMSolverMultistepScheduler(
 				num_train_timesteps=1000,
 				shift=shift,
-				use_dynamic_shifting=True,  # Enable dynamic shifting
-				algorithm_type=algorithm_type,
-				solver_order=2)  # Use solver order 2 for better performance
+				use_dynamic_shifting=False,
+				algorithm_type=algorithm_type)
 			sampling_sigmas = get_sampling_sigmas(steps, shift)
 			timesteps, _ = retrieve_timesteps(
 				sample_scheduler,
@@ -739,7 +661,7 @@ class WanVideoGenerator:
 			noise = noise * latent_timestep / 1000 + (1 - latent_timestep / 1000) * samples["samples"].squeeze(0).to(
 				noise)
 
-		# Initialize latent
+		# Initialize latent on CPU first, then move to GPU when needed
 		latent = noise
 
 		# Set up rope parameters
@@ -781,80 +703,45 @@ class WanVideoGenerator:
 					param.data = param.data.to(self.device)
 
 			# Use block swapping (loads only necessary blocks during inference)
-			if hasattr(transformer, "block_swap"):
-				transformer.block_swap(
-					model_info["block_swap_args"]["blocks_to_swap"] - 1,
-				)
+			transformer.block_swap(
+				model_info["block_swap_args"]["blocks_to_swap"] - 1,
+			)
 		else:
 			if model_info["manual_offloading"]:
 				transformer.to(self.device)
 
 		soft_empty_cache()
 
-		# Set up for CUDA graph optimization
-		use_cuda_graph = False
-		cuda_graph_configured = False
-		cuda_graphs = {}
-		static_shapes = True  # Need static shapes for CUDA graphs
-
-		# Only use CUDA graphs if the model architecture supports it
-		if static_shapes and torch.cuda.is_available() and hasattr(torch.cuda, "make_graphed_callables"):
-			try:
-				use_cuda_graph = True
-				print("Using CUDA graphs for faster inference")
-			except:
-				use_cuda_graph = False
-				print("CUDA graphs not supported, using standard inference")
-
 		# Turn off gradients for memory efficiency
 		with torch.no_grad():
 			# Enable mixed precision for memory efficiency
-			with torch.cuda.amp.autocast(enabled=True):
+			with torch.autocast(device_type=self.device.split(':')[0], dtype=model_info["dtype"], enabled=True):
 				for i, t in enumerate(tqdm(timesteps)):
-					# Move latent to GPU during processing
+					# Only move latent to GPU during processing - like ComfyUI
 					latent_gpu = latent.to(self.device)
 					latent_model_input = [latent_gpu]
 					timestep = torch.tensor([t], device=self.device)
 
-					# Try using CUDA graphs for repeated operations if available
-					if use_cuda_graph and i > 0 and not cuda_graph_configured:
-						# Configure CUDA graph for conditional pass
-						try:
-							# Create a graph for conditional inference
-							def cond_fn():
-								return transformer(latent_model_input, t=timestep, **arg_c)[0]
+					# Get conditional noise prediction and immediately move to CPU
+					noise_pred_cond = transformer(
+						latent_model_input, t=timestep, **arg_c)[0].to(self.offload_device)
 
-							graphed_cond_fn = torch.cuda.make_graphed_callables(cond_fn, ())
-							cuda_graphs['cond'] = graphed_cond_fn
+					# Free GPU memory
+					del latent_gpu
+					soft_empty_cache()
 
-							# If using CFG, create a graph for unconditional inference
-							if cfg[i] != 1.0:
-								def uncond_fn():
-									return transformer(latent_model_input, t=timestep, **arg_null)[0]
-
-								graphed_uncond_fn = torch.cuda.make_graphed_callables(uncond_fn, ())
-								cuda_graphs['uncond'] = graphed_uncond_fn
-
-							cuda_graph_configured = True
-							print("CUDA graphs configured successfully")
-						except Exception as e:
-							print(f"CUDA graph configuration failed: {e}, falling back to standard inference")
-							use_cuda_graph = False
-
-					# Get noise prediction (use CUDA graph if configured)
-					if use_cuda_graph and cuda_graph_configured and i > 0:
-						noise_pred_cond = cuda_graphs['cond']()
-					else:
-						noise_pred_cond = transformer(
-							latent_model_input, t=timestep, **arg_c)[0]
-
-					# Get unconditional prediction if needed
 					if cfg[i] != 1.0:
-						if use_cuda_graph and cuda_graph_configured and i > 0 and 'uncond' in cuda_graphs:
-							noise_pred_uncond = cuda_graphs['uncond']()
-						else:
-							noise_pred_uncond = transformer(
-								latent_model_input, t=timestep, **arg_null)[0]
+						# Move latent back to GPU for unconditional pass
+						latent_gpu = latent.to(self.device)
+						latent_model_input = [latent_gpu]
+
+						# Get unconditional noise prediction and immediately move to CPU
+						noise_pred_uncond = transformer(
+							latent_model_input, t=timestep, **arg_null)[0].to(self.offload_device)
+
+						# Free GPU memory again
+						del latent_gpu
+						soft_empty_cache()
 
 						# Compute weighted noise prediction
 						noise_pred = noise_pred_uncond + cfg[i] * (
@@ -862,26 +749,24 @@ class WanVideoGenerator:
 					else:
 						noise_pred = noise_pred_cond
 
+					# Move needed tensors to GPU for sampling step
+					noise_pred_gpu = noise_pred.to(self.device)
+					latent_gpu = latent.to(self.device)
+
 					# Perform sampling step
 					temp_x0 = sample_scheduler.step(
-						noise_pred.unsqueeze(0),
+						noise_pred_gpu.unsqueeze(0),
 						t,
 						latent_gpu.unsqueeze(0),
 						return_dict=False,
 						generator=seed_g)[0]
 
-					# Update latent
+					# Update latent and keep on CPU
 					latent = temp_x0.squeeze(0).cpu()
 
 					# Free GPU memory
-					del noise_pred_cond, latent_gpu, latent_model_input, timestep
-					if cfg[i] != 1.0 and 'noise_pred_uncond' in locals():
-						del noise_pred_uncond
-					del noise_pred
-
-					# Less aggressive memory clearing during loop
-					if i % 5 == 0:
-						soft_empty_cache()
+					del noise_pred_gpu, latent_gpu, latent_model_input, timestep
+					soft_empty_cache()
 
 		# Move final result to GPU for one last processing
 		latent_gpu = latent.to(self.device)
@@ -897,8 +782,8 @@ class WanVideoGenerator:
 		return {"samples": result}
 
 	def decode(self, vae, samples, enable_vae_tiling=True,
-	           tile_x=320, tile_y=320, tile_stride_x=192, tile_stride_y=192):
-		"""Decode latents into video frames with optimized tiling parameters."""
+	           tile_x=272, tile_y=272, tile_stride_x=144, tile_stride_y=128):
+		"""Decode latents into video frames."""
 		print("Decoding video frames...")
 
 		soft_empty_cache()
@@ -911,14 +796,14 @@ class WanVideoGenerator:
 		latents = latents.to(device=self.device, dtype=vae.dtype)
 
 		# Use mixed precision for decoding to save memory
-		with torch.cuda.amp.autocast(), torch.no_grad():
-			# Decode in tiles for memory efficiency with optimized tiling parameters
+		with torch.cuda.amp.autocast():
+			# Decode in tiles for memory efficiency
 			image = vae.decode(
 				latents,
 				device=self.device,
 				tiled=enable_vae_tiling,
-				tile_size=(tile_x, tile_y),  # Larger tiles for fewer operations
-				tile_stride=(tile_stride_x, tile_stride_y)  # Less overlap for speed
+				tile_size=(tile_x, tile_y),
+				tile_stride=(tile_stride_x, tile_stride_y)
 			)[0]
 
 		# Clean up
@@ -971,10 +856,10 @@ class WanVideoGenerator:
 
 	                   # VAE settings
 	                   enable_vae_tiling=True,
-	                   tile_x=320,  # Optimized tile size
-	                   tile_y=320,  # Optimized tile size
-	                   tile_stride_x=192,  # Optimized stride
-	                   tile_stride_y=192,  # Optimized stride
+	                   tile_x=272,
+	                   tile_y=272,
+	                   tile_stride_x=144,
+	                   tile_stride_y=128,
 
 	                   # Image to Video settings
 	                   input_image=None,
@@ -992,12 +877,8 @@ class WanVideoGenerator:
 	                   fps=16
 	                   ):
 		"""
-		Generate a video using the WanVideo model with optimized performance.
+		Generate a video using the WanVideo model.
 		"""
-		# Pre-warm CUDA for faster first inference
-		if torch.cuda.is_available():
-			torch.cuda.synchronize()
-
 		print(f"Generating video...")
 		print(f"Prompt: {positive_prompt}")
 
@@ -1061,6 +942,9 @@ class WanVideoGenerator:
 			raise ValueError("No T5 encoder found. Please specify t5_path.")
 		if input_image is not None and clip_path is None:
 			raise ValueError("No CLIP encoder found for I2V. Please specify clip_path.")
+
+		# Rest of the method remains unchanged
+		# ...
 
 		# 1. Load all required models
 		print("Loading models...")
@@ -1139,7 +1023,7 @@ class WanVideoGenerator:
 			denoise_strength=denoise_strength
 		)
 
-		# 5. Decode the video frames with optimized parameters
+		# 5. Decode the video frames
 		video_frames = self.decode(
 			vae=vae,
 			samples=samples,
@@ -1168,28 +1052,14 @@ class WanVideoGenerator:
 		return video_frames
 
 	def save_video(self, video_frames, save_path, fps=16, format="mp4"):
-		"""Save video frames to a file with optimized encoding."""
+		"""Save video frames to a file."""
 		frames = (video_frames * 255).to(torch.uint8).numpy()
 
 		if format == "frames":
 			os.makedirs(save_path, exist_ok=True)
-			# Use parallel processing for saving frames if many frames
-			if len(frames) > 20 and 'multiprocessing' in globals():
-				from multiprocessing import Pool
-				from functools import partial
-
-				def save_frame(i_frame, save_dir):
-					i, frame = i_frame
-					img = Image.fromarray(frame)
-					img.save(os.path.join(save_dir, f"frame_{i:05d}.png"))
-
-				with Pool(processes=min(os.cpu_count(), 8)) as pool:
-					pool.map(partial(save_frame, save_dir=save_path), enumerate(frames))
-			else:
-				# Sequential saving
-				for i, frame in enumerate(frames):
-					img = Image.fromarray(frame)
-					img.save(os.path.join(save_path, f"frame_{i:05d}.png"))
+			for i, frame in enumerate(frames):
+				img = Image.fromarray(frame)
+				img.save(os.path.join(save_path, f"frame_{i:05d}.png"))
 			return
 
 		try:
@@ -1198,9 +1068,7 @@ class WanVideoGenerator:
 			if format == "gif":
 				imageio.mimsave(save_path, frames, fps=fps)
 			elif format == "mp4":
-				# Use higher quality settings
-				imageio.mimsave(save_path, frames, fps=fps, codec="libx264", quality=8,
-				                output_params=['-pix_fmt', 'yuv420p'])
+				imageio.mimsave(save_path, frames, fps=fps, codec="libx264", quality=7)
 			else:
 				raise ValueError(f"Unsupported format: {format}")
 		except ImportError:
@@ -1225,6 +1093,7 @@ def main():
 	parser.add_argument("--num_frames", type=int, default=81, help="Number of frames to generate")
 	parser.add_argument("--steps", type=int, default=10, help="Number of sampling steps")
 	parser.add_argument("--cfg", type=float, default=6.0, help="Classifier-free guidance scale")
+	parser.add_argument("--shift", type=float, default=5.0, help="Scheduler shift parameter")
 	parser.add_argument("--shift", type=float, default=3.0, help="Scheduler shift parameter")
 	parser.add_argument("--seed", type=int, default=None, help="Random seed")
 	parser.add_argument("--scheduler", type=str, default="dpm++", choices=["dpm++", "dpm++_sde", "unipc"],
@@ -1243,12 +1112,6 @@ def main():
 	t5_path = os.path.join(args.models_dir, "text_encoders", "umt5-xxl-enc-fp8_e4m3fn.safetensors")
 	clip_path = os.path.join(args.models_dir, "clip", "open-clip-xlm-roberta-large-vit-huge-14_fp16.safetensors")
 
-	# Pre-warm CUDA to reduce first inference latency
-	if torch.cuda.is_available():
-		dummy = torch.zeros(1, device="cuda")
-		del dummy
-		torch.cuda.empty_cache()
-
 	# Clear CUDA cache before starting
 	torch.cuda.empty_cache()
 	gc.collect()
@@ -1266,18 +1129,18 @@ def main():
 	if args.input_image:
 		input_img = Image.open(args.input_image).convert("RGB")
 
-	# Generate video with optimized settings
+	# Generate video with our custom FP8 implementation
 	generator.generate_video(
 		model_path=model_path,
 		vae_path=vae_path,
 		t5_path=t5_path,
 		clip_path=clip_path,
-		base_precision="fp16",
+		base_precision="fp16",  # Use fp16 for base precision
 		vae_precision="bf16",
 		t5_precision="bf16",
 		clip_precision="fp16",
-		quantization="fp8_e4m3fn_fast",
-		attention_mode="sdpa",  # Will use Flash Attention if available
+		quantization="fp8_e4m3fn",  # Use our custom FP8 implementation
+		attention_mode="sdpa",
 		blocks_to_swap=args.blocks_to_swap,
 		positive_prompt=args.positive_prompt,
 		negative_prompt=args.negative_prompt,
@@ -1289,17 +1152,11 @@ def main():
 		shift=args.shift,
 		seed=args.seed,
 		scheduler=args.scheduler,
-		force_offload=True,
+		force_offload=True,  # Always offload models to CPU when not in use
 		input_image=input_img,
 		noise_aug_strength=args.noise_aug_strength,
 		save_path=args.output,
-		fps=args.fps,
-		# Optimized VAE parameters
-		enable_vae_tiling=True,
-		tile_x=320,
-		tile_y=320,
-		tile_stride_x=192,
-		tile_stride_y=192
+		fps=args.fps
 	)
 
 
