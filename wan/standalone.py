@@ -9,6 +9,21 @@ from PIL import Image
 import glob
 from safetensors.torch import load_file
 
+# Add ONNX and TensorRT imports
+import onnx
+import onnxruntime as ort
+
+try:
+	import tensorrt as trt
+	from cuda import cudart
+	import pycuda.driver as cuda
+	import pycuda.autoinit
+
+	TRT_AVAILABLE = True
+except ImportError:
+	print("TensorRT not available, falling back to ONNX Runtime")
+	TRT_AVAILABLE = False
+
 # Import the WanVideo modules
 from wanvideo.modules.clip import CLIPModel
 from wanvideo.modules.model import WanModel, rope_params
@@ -21,27 +36,361 @@ from wanvideo.wan_video_vae import WanVideoVAE
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 
-# Add after imports
-if torch.cuda.is_available():
-	# Set optimal TF32 mode for Ampere+ GPUs
-	torch.backends.cuda.matmul.allow_tf32 = True
-	torch.backends.cudnn.allow_tf32 = True
 
-	# Enable cuDNN benchmarking for best performance
-	torch.backends.cudnn.benchmark = True
+# TensorRT/ONNX utility functions
+class ONNXExporter:
+	"""Utility class for exporting PyTorch models to ONNX format"""
 
-	# Disable gradient synchronization
-	torch.cuda.set_sync_debug_mode(0)
+	@staticmethod
+	def export_model(model, input_tensor, onnx_path, input_names=None, output_names=None,
+	                 dynamic_axes=None, opset_version=17):
+		"""
+		Export a PyTorch model to ONNX format
 
-	# Set device to high priority stream
-	current_stream = torch.cuda.current_stream()
-	current_stream.priority = -1  # High priority
+		Args:
+			model: PyTorch model
+			input_tensor: Example input tensor(s)
+			onnx_path: Path to save the ONNX model
+			input_names: Names for the input nodes
+			output_names: Names for the output nodes
+			dynamic_axes: Dictionary with dynamic axes for inputs/outputs
+			opset_version: ONNX opset version
+		"""
+		if not input_names:
+			input_names = ['input']
+		if not output_names:
+			output_names = ['output']
+
+		print(f"Exporting model to ONNX: {onnx_path}")
+
+		# Ensure the directory exists
+		os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
+
+		# Set the model to evaluation mode
+		model.eval()
+
+		# Export the model to ONNX
+		torch.onnx.export(
+			model,
+			input_tensor,
+			onnx_path,
+			export_params=True,
+			opset_version=opset_version,
+			do_constant_folding=True,
+			input_names=input_names,
+			output_names=output_names,
+			dynamic_axes=dynamic_axes,
+			verbose=False
+		)
+
+		print(f"Model exported to {onnx_path}")
+
+		# Verify the ONNX model
+		onnx_model = onnx.load(onnx_path)
+		onnx.checker.check_model(onnx_model)
+		print("ONNX model verified successfully")
+
+		return onnx_path
+
+	@staticmethod
+	def optimize_onnx_model(onnx_path, optimized_path=None):
+		"""
+		Optimize an ONNX model using ONNX Runtime
+
+		Args:
+			onnx_path: Path to the ONNX model
+			optimized_path: Path to save the optimized model (default: same as input with _optimized suffix)
+
+		Returns:
+			Path to the optimized model
+		"""
+		if not optimized_path:
+			optimized_path = onnx_path.replace('.onnx', '_optimized.onnx')
+
+		print(f"Optimizing ONNX model: {onnx_path}")
+
+		# Use ONNX Runtime to optimize the model
+		from onnxruntime.transformers import optimizer
+		opt_options = optimizer.OptimizationOptions()
+		optimized_model = optimizer.optimize_model(
+			onnx_path,
+			'bert',  # Use transformer-based optimization
+			num_heads=12,  # Adjust based on your model
+			hidden_size=768,  # Adjust based on your model
+			opt_level=99,
+			optimization_options=opt_options
+		)
+
+		optimized_model.save_model_to_file(optimized_path)
+		print(f"Optimized model saved to {optimized_path}")
+
+		return optimized_path
+
+
+class TensorRTEngine:
+	"""Utility class for converting ONNX models to TensorRT engines and inference"""
+
+	def __init__(self):
+		"""Initialize TensorRT-related utilities"""
+		if TRT_AVAILABLE:
+			self.logger = trt.Logger(trt.Logger.WARNING)
+			self.runtime = trt.Runtime(self.logger)
+			# Print TensorRT version info
+			print(f"TensorRT version: {trt.__version__}")
+
+			# Get supported device properties
+			if hasattr(trt, 'get_device_properties'):
+				for i in range(cudart.cudaGetDeviceCount()[1]):
+					props = trt.get_device_properties(i)
+					print(
+						f"GPU {i}: {props.name}, Compute: {props.major}.{props.minor}, Memory: {props.total_memory / 1024 / 1024 / 1024:.2f} GB")
+		else:
+			self.logger = None
+			self.runtime = None
+			print("TensorRT not available, using ONNX Runtime for inference.")
+
+	def build_engine(self, onnx_path, engine_path=None, fp16_mode=True,
+	                 max_workspace_size=1 << 30, input_shapes=None,
+	                 use_dla=False, dla_core=0, use_strict_types=False,
+	                 force_rebuild=False, tactic_sources=None, avg_timing_iterations=8):
+		"""
+		Build a TensorRT engine from an ONNX model with advanced configuration
+
+		Args:
+			onnx_path: Path to the ONNX model
+			engine_path: Path to save the TensorRT engine (default: same as input with .engine suffix)
+			fp16_mode: Whether to enable FP16 mode
+			max_workspace_size: Maximum workspace size (default: 1GB)
+			input_shapes: Dictionary mapping input names to their shapes with min/opt/max values
+			use_dla: Whether to use DLA (Deep Learning Accelerator) if available
+			dla_core: Which DLA core to use
+			use_strict_types: Whether to use strict types for TensorRT optimization
+			force_rebuild: Whether to force rebuild even if engine exists
+			tactic_sources: List of tactic sources to use for optimization
+			avg_timing_iterations: Number of timing iterations for kernel selection
+
+		Returns:
+			Path to the TensorRT engine
+		"""
+		if not TRT_AVAILABLE:
+			print("TensorRT not available, cannot build engine")
+			return None
+
+		if not engine_path:
+			engine_path = onnx_path.replace('.onnx', '.engine')
+
+		print(f"Building TensorRT engine from {onnx_path}")
+
+		# Check if engine already exists
+		if os.path.exists(engine_path) and not force_rebuild:
+			print(f"Engine {engine_path} already exists. Loading...")
+			with open(engine_path, 'rb') as f:
+				engine_bytes = f.read()
+			engine = self.runtime.deserialize_cuda_engine(engine_bytes)
+			return engine_path
+
+		# Create builder and network
+		builder = trt.Builder(self.logger)
+		network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+		config = builder.create_builder_config()
+		parser = trt.OnnxParser(network, self.logger)
+
+		# Set config properties
+		config.max_workspace_size = max_workspace_size
+
+		# Enable FP16 mode if requested and supported
+		if fp16_mode and builder.platform_has_fast_fp16:
+			config.set_flag(trt.BuilderFlag.FP16)
+			print("Enabled FP16 mode")
+
+		# Set timing iterations for kernel selection
+		config.avg_timing_iterations = avg_timing_iterations
+
+		# Enable strict types if requested
+		if use_strict_types:
+			config.set_flag(trt.BuilderFlag.STRICT_TYPES)
+			print("Enabled strict types")
+
+		# Configure DLA if requested and available
+		if use_dla:
+			if hasattr(builder, 'platform_has_fast_dla') and builder.platform_has_fast_dla:
+				print(f"Using DLA core {dla_core}")
+				config.default_device_type = trt.DeviceType.DLA
+				config.DLA_core = dla_core
+				# Also enable GPU fallback for operations not supported on DLA
+				config.set_flag(trt.BuilderFlag.GPU_FALLBACK)
+			else:
+				print("DLA not available, using GPU instead")
+
+		# Configure tactic sources if specified
+		if tactic_sources and hasattr(config, 'set_tactic_sources'):
+			enabled_sources = 0
+			if 'CUBLAS' in tactic_sources:
+				enabled_sources |= 1 << int(trt.TacticSource.CUBLAS)
+			if 'CUBLAS_LT' in tactic_sources:
+				enabled_sources |= 1 << int(trt.TacticSource.CUBLAS_LT)
+			if 'CUDNN' in tactic_sources:
+				enabled_sources |= 1 << int(trt.TacticSource.CUDNN)
+			if 'EDGE_MASK_CONVOLUTIONS' in tactic_sources:
+				enabled_sources |= 1 << int(trt.TacticSource.EDGE_MASK_CONVOLUTIONS)
+
+			config.set_tactic_sources(enabled_sources)
+			print(f"Set tactic sources: {tactic_sources}")
+
+		# Parse ONNX model
+		with open(onnx_path, 'rb') as model:
+			model_bytes = model.read()
+			if not parser.parse(model_bytes):
+				for error in range(parser.num_errors):
+					print(f"ONNX parsing error: {parser.get_error(error)}")
+				return None
+
+		# Set optimization profiles for dynamic shapes
+		if input_shapes:
+			profile = builder.create_optimization_profile()
+			for input_name, shapes in input_shapes.items():
+				min_shape, opt_shape, max_shape = shapes
+				profile.set_shape(input_name, min_shape, opt_shape, max_shape)
+			config.add_optimization_profile(profile)
+
+		# Print network info
+		print(f"Network has {network.num_layers} layers and {network.num_inputs} inputs, {network.num_outputs} outputs")
+		for i in range(network.num_inputs):
+			input_tensor = network.get_input(i)
+			print(f"Input {i}: {input_tensor.name}, shape: {input_tensor.shape}, dtype: {input_tensor.dtype}")
+		for i in range(network.num_outputs):
+			output_tensor = network.get_output(i)
+			print(f"Output {i}: {output_tensor.name}, shape: {output_tensor.shape}, dtype: {output_tensor.dtype}")
+
+		# Build and save engine
+		print("Building TensorRT engine... This may take a while.")
+		engine = builder.build_engine(network, config)
+		if engine:
+			with open(engine_path, 'wb') as f:
+				engine_bytes = engine.serialize()
+				f.write(engine_bytes)
+			print(f"TensorRT engine saved to {engine_path}")
+		else:
+			print("Failed to build TensorRT engine")
+
+		return engine_path
+
+	def load_engine(self, engine_path):
+		"""
+		Load a TensorRT engine from file
+
+		Args:
+			engine_path: Path to the TensorRT engine
+
+		Returns:
+			TensorRT engine
+		"""
+		if not TRT_AVAILABLE:
+			print("TensorRT not available, cannot load engine")
+			return None
+
+		print(f"Loading TensorRT engine from {engine_path}")
+
+		with open(engine_path, 'rb') as f:
+			engine_bytes = f.read()
+
+		engine = self.runtime.deserialize_cuda_engine(engine_bytes)
+		return engine
+
+	def allocate_buffers(self, engine, batch_size=1):
+		"""
+		Allocate device buffers for TensorRT inference
+
+		Args:
+			engine: TensorRT engine
+			batch_size: Batch size
+
+		Returns:
+			Dictionaries for input/output host and device buffers, and bindings
+		"""
+		if not TRT_AVAILABLE:
+			return None, None, None
+
+		inputs = []
+		outputs = []
+		bindings = []
+
+		# Collect all input and output dimensions
+		for binding in range(engine.num_bindings):
+			binding_dims = tuple(engine.get_binding_shape(binding))
+			binding_dims = (batch_size,) + binding_dims[1:] if engine.binding_is_input(binding) else binding_dims
+			size = trt.volume(binding_dims) * engine.max_batch_size
+			dtype = trt.nptype(engine.get_binding_dtype(binding))
+
+			# Allocate host and device buffers
+			host_mem = cuda.pagelocked_empty(size, dtype)
+			device_mem = cuda.mem_alloc(host_mem.nbytes)
+
+			# Append info to the appropriate lists
+			bindings.append(int(device_mem))
+			if engine.binding_is_input(binding):
+				inputs.append({'host': host_mem, 'device': device_mem, 'name': engine.get_binding_name(binding)})
+			else:
+				outputs.append({'host': host_mem, 'device': device_mem, 'name': engine.get_binding_name(binding)})
+
+		return inputs, outputs, bindings
+
+	def infer(self, engine, inputs, outputs, bindings, input_data):
+		"""
+		Run inference using a TensorRT engine
+
+		Args:
+			engine: TensorRT engine
+			inputs: List of input buffers
+			outputs: List of output buffers
+			bindings: List of binding points
+			input_data: Dictionary mapping input names to numpy arrays
+
+		Returns:
+			Dictionary mapping output names to numpy arrays
+		"""
+		if not TRT_AVAILABLE:
+			print("TensorRT not available, cannot run inference")
+			return None
+
+		# Create execution context
+		context = engine.create_execution_context()
+
+		# Transfer input data to the GPU
+		for input_buffer in inputs:
+			if input_buffer['name'] in input_data:
+				data = input_data[input_buffer['name']]
+				np.copyto(input_buffer['host'], data.ravel())
+				cuda.memcpy_htod(input_buffer['device'], input_buffer['host'])
+
+		# Run inference
+		stream = cuda.Stream()
+		context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
+
+		# Transfer predictions back from GPU
+		for output_buffer in outputs:
+			cuda.memcpy_dtoh_async(output_buffer['host'], output_buffer['device'], stream)
+
+		# Synchronize the stream
+		stream.synchronize()
+
+		# Create output dictionary
+		output_data = {}
+		for output_buffer in outputs:
+			# Reshape the output data to match the expected dimensions
+			output_data[output_buffer['name']] = np.reshape(
+				output_buffer['host'],
+				context.get_binding_shape(engine.get_binding_index(output_buffer['name']))
+			)
+
+		return output_data
+
 
 # Custom FP8 optimization implementation matching ComfyUI approach
 def fp8_linear_forward_custom(cls, original_dtype, input):
 	"""
-    Custom implementation of FP8 linear forward pass that follows ComfyUI's approach
-    """
+	Custom implementation of FP8 linear forward pass that follows ComfyUI's approach
+	"""
 	if hasattr(cls, "original_forward"):
 		return cls.original_forward(input.to(original_dtype))
 	else:
@@ -50,42 +399,22 @@ def fp8_linear_forward_custom(cls, original_dtype, input):
 
 def convert_fp8_linear(module, original_dtype, params_to_keep={}):
 	"""
-	Enhanced FP8 optimization with better memory scaling
+	Convert linear layers to use custom FP8 implementation
+	Matches ComfyUI's approach for memory optimization
 	"""
+	# Flag to indicate we've applied FP8 optimization
 	setattr(module, "fp8_matmul_enabled", True)
 
-	# Cache for intermediate calculations
-	if not hasattr(module, "_fp8_cache"):
-		module._fp8_cache = {}
-
-	for name, sub_module in module.named_modules():
+	for name, module in module.named_modules():
 		if not any(keyword in name for keyword in params_to_keep):
-			if isinstance(sub_module, torch.nn.Linear):
+			if isinstance(module, torch.nn.Linear):
 				# Store the original forward function
-				original_forward = sub_module.forward
-				setattr(sub_module, "original_forward", original_forward)
+				original_forward = module.forward
+				setattr(module, "original_forward", original_forward)
 
-				# Use better precision for small matrices
-				weight_size = sub_module.weight.numel()
-				use_fp16 = weight_size < 1000000  # Use fp16 for smaller matrices
+				# Replace with our custom implementation
+				setattr(module, "forward", lambda input, m=module: fp8_linear_forward_custom(m, original_dtype, input))
 
-				# Enhanced forward with caching for common input shapes
-				def enhanced_forward(input, m=sub_module, use_fp16=use_fp16):
-					input_shape = input.shape
-					cache_key = (input_shape, input.device)
-
-					# Check for cached calculations
-					if hasattr(m, "_fp8_cache") and cache_key in m._fp8_cache:
-						cached_dtype = m._fp8_cache[cache_key]
-					else:
-						cached_dtype = torch.float16 if use_fp16 else original_dtype
-						if hasattr(m, "_fp8_cache"):
-							m._fp8_cache[cache_key] = cached_dtype
-
-					# Run with appropriate precision
-					return m.original_forward(input.to(cached_dtype))
-
-				setattr(sub_module, "forward", enhanced_forward)
 
 # Memory management utilities with aggressive cleanup
 def print_memory(device):
@@ -96,12 +425,10 @@ def print_memory(device):
 
 
 def soft_empty_cache():
-    """Aggressively clean GPU memory with better timing"""
-    if torch.cuda.is_available():
-        # Add synchronization before cleanup
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        gc.collect()
+	"""Aggressively clean GPU memory"""
+	if torch.cuda.is_available():
+		torch.cuda.empty_cache()
+		gc.collect()
 
 
 def add_noise_to_reference_video(image, ratio=None):
@@ -147,68 +474,17 @@ def common_upscale(samples, width, height, upscale_method, crop):
 	return samples
 
 
-class BlockSwapManager:
-	def __init__(self, model, blocks_to_swap, device, offload_device="cpu"):
-		self.model = model
-		self.max_active_blocks = blocks_to_swap
-		self.device = device
-		self.offload_device = offload_device
-		self.active_blocks = set()
-		self.block_map = {}
-
-		# Map all block parameters
-		for name, param in model.named_parameters():
-			if "blocks." in name:
-				block_id = int(name.split("blocks.")[1].split(".")[0])
-				if block_id not in self.block_map:
-					self.block_map[block_id] = []
-				self.block_map[block_id].append(name)
-
-	def activate_block(self, block_id):
-		"""Move a specific block to GPU"""
-		if block_id in self.active_blocks:
-			return
-
-		# Ensure we don't exceed max active blocks
-		while len(self.active_blocks) >= self.max_active_blocks:
-			# Remove oldest block (simple FIFO)
-			oldest = min(self.active_blocks)
-			self.deactivate_block(oldest)
-
-		# Move block to device
-		if block_id in self.block_map:
-			for param_name in self.block_map[block_id]:
-				param = self.model.get_parameter(param_name)
-				param.data = param.data.to(self.device)
-			self.active_blocks.add(block_id)
-
-	def deactivate_block(self, block_id):
-		"""Move a specific block to CPU"""
-		if block_id not in self.active_blocks:
-			return
-
-		if block_id in self.block_map:
-			for param_name in self.block_map[block_id]:
-				param = self.model.get_parameter(param_name)
-				param.data = param.data.to(self.offload_device)
-			self.active_blocks.remove(block_id)
-
-	def activate_sequential_blocks(self, start_block, count):
-		"""Activate a sequence of blocks for processing"""
-		for i in range(start_block, min(start_block + count, max(self.block_map.keys()) + 1)):
-			self.activate_block(i)
-
 class WanVideoGenerator:
 	def __init__(self, models_dir, device="cuda:0", t5_tokenizer_path=None, clip_tokenizer_path=None):
 		"""
-        Initialize the WanVideo generator.
+		Initialize the WanVideo generator.
 
-        Args:
-            models_dir (str): Directory containing model files
-            device (str): Device to use for computation (default: "cuda:0")
-            t5_tokenizer_path (str): Path to T5 tokenizer
-            clip_tokenizer_path (str): Path to CLIP tokenizer
-        """
+		Args:
+			models_dir (str): Directory containing model files
+			device (str): Device to use for computation (default: "cuda:0")
+			t5_tokenizer_path (str): Path to T5 tokenizer
+			clip_tokenizer_path (str): Path to CLIP tokenizer
+		"""
 		self.models_dir = models_dir
 		self.device = device
 
@@ -222,10 +498,31 @@ class WanVideoGenerator:
 		# Store loaded models
 		self.loaded_models = {}
 
+		# Directory for ONNX models and TensorRT engines
+		self.onnx_dir = os.path.join(models_dir, "onnx")
+		os.makedirs(self.onnx_dir, exist_ok=True)
+
+		# Initialize TensorRT utilities
+		self.trt_engine = TensorRTEngine() if TRT_AVAILABLE else None
+
+		# Track exported models to avoid duplicate exports
+		self.exported_models = {}
+
 	def load_model(self, model_path, base_precision="bf16", load_device="main_device",
 	               quantization="disabled", attention_mode="sdpa", blocks_to_swap=0):
 		"""
-		Load the WanVideo transformer model with enhanced memory management.
+		Load the WanVideo transformer model.
+
+		Args:
+			model_path (str): Path to model file
+			base_precision (str): Model precision (fp32, bf16, fp16)
+			load_device (str): Which device to load model to (main_device or offload_device)
+			quantization (str): Optional quantization method
+			attention_mode (str): Attention implementation to use
+			blocks_to_swap (int): Number of blocks to swap to CPU for VRAM optimization
+
+		Returns:
+			dict: Loaded model and configuration
 		"""
 		print(f"Loading model from {model_path}...")
 		soft_empty_cache()
@@ -291,15 +588,12 @@ class WanVideoGenerator:
 			params_to_keep = {"norm", "head", "bias", "time_in", "vector_in", "patch_embedding", "time_", "img_emb",
 			                  "modulation"}
 
-			# Use blocks_to_swap if provided, otherwise use default
-			effective_blocks_to_swap = blocks_to_swap if blocks_to_swap > 0 else self.default_blocks_to_swap
-
 			# Load parameters with appropriate dtypes
 			for name, param in transformer.named_parameters():
 				dtype_to_use = base_dtype if any(keyword in name for keyword in params_to_keep) else dtype
 
 				# Check if this is a block parameter - if so, keep on CPU for now if using block_swap
-				if effective_blocks_to_swap > 0 and "blocks." in name:
+				if blocks_to_swap > 0 and "block" in name:
 					load_dev = self.offload_device
 				else:
 					load_dev = transformer_load_device
@@ -314,18 +608,10 @@ class WanVideoGenerator:
 			pass
 
 		# Prepare block swapping
-		block_swap_args = None
-		if blocks_to_swap > 0 or self.default_blocks_to_swap > 0:
-			effective_blocks = blocks_to_swap if blocks_to_swap > 0 else self.default_blocks_to_swap
-			block_swap_args = {"blocks_to_swap": effective_blocks}
-
-			# Initialize block manager
-			self.block_manager = BlockSwapManager(
-				transformer,
-				max_active_blocks=effective_blocks,
-				device=self.device,
-				offload_device=self.offload_device
-			)
+		if blocks_to_swap > 0:
+			block_swap_args = {"blocks_to_swap": blocks_to_swap}
+		else:
+			block_swap_args = None
 
 		model_info = {
 			"model": transformer,
@@ -335,8 +621,7 @@ class WanVideoGenerator:
 			"manual_offloading": manual_offloading,
 			"quantization": quantization,
 			"block_swap_args": block_swap_args,
-			"model_type": model_type,
-			"num_layers": num_layers
+			"model_type": model_type
 		}
 
 		del sd
@@ -345,16 +630,11 @@ class WanVideoGenerator:
 
 		# Apply our custom FP8 optimization
 		if quantization in ["fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_scaled"]:
-			print("Applying optimized FP8 optimization to linear layers...")
+			print("Applying custom FP8 optimization to linear layers...")
 			params_to_keep = {"norm", "head", "bias", "time_in", "vector_in", "patch_embedding", "time_", "img_emb",
 			                  "modulation"}
 			convert_fp8_linear(transformer, base_dtype, params_to_keep=params_to_keep)
 			print("FP8 optimization applied.")
-
-		# Use flash attention if available on compatible hardware
-		if torch.cuda.get_device_capability(0)[0] >= 8 and attention_mode == "sdpa":
-			print("Enabling Flash Attention optimizations")
-			transformer.use_flash_attention = True
 
 		self.loaded_models["diffusion_model"] = model_info
 		return model_info
@@ -427,27 +707,119 @@ class WanVideoGenerator:
 		self.loaded_models["clip_model"] = clip_model
 		return clip_model
 
-	def encode_text(self, t5_encoder, positive_prompt, negative_prompt, force_offload=True):
+	def encode_text(self, t5_encoder, positive_prompt, negative_prompt, force_offload=True, use_onnx=False):
 		"""Encode text prompts using the T5 encoder."""
 		print(f"Encoding prompts:\nPositive: {positive_prompt}\nNegative: {negative_prompt}")
 
 		encoder = t5_encoder["model"]
 		dtype = t5_encoder["dtype"]
 
-		# Move encoder to device for processing
-		encoder.model.to(self.device)
+		# Check if this model has been exported to ONNX
+		onnx_path = os.path.join(self.onnx_dir, "t5_encoder.onnx")
+		engine_path = onnx_path.replace(".onnx", ".engine")
 
-		with torch.autocast(device_type=self.device.split(':')[0], dtype=dtype, enabled=True):
-			context = encoder([positive_prompt], self.device)
-			context_null = encoder([negative_prompt], self.device)
+		if use_onnx and not os.path.exists(onnx_path) and not "t5_encoder" in self.exported_models:
+			# Export model to ONNX if requested
+			print("Exporting T5 encoder to ONNX...")
 
-		context = [t.to(self.device) for t in context]
-		context_null = [t.to(self.device) for t in context_null]
+			# First make sure the model is on the correct device
+			encoder.model.to(self.device)
 
-		# Aggressively offload when done
-		if force_offload:
-			encoder.model.to(self.offload_device)
-			soft_empty_cache()
+			# Create dummy input for ONNX export
+			dummy_input = ["This is a test prompt"]
+
+			# Define ONNX export for T5Encoder
+			onnx_model = ONNXExporter.export_model(
+				encoder,
+				dummy_input,
+				onnx_path,
+				input_names=["input_text"],
+				output_names=["output_embeds"],
+				dynamic_axes={
+					"input_text": {0: "batch_size"},
+					"output_embeds": {0: "batch_size", 1: "sequence_length"}
+				}
+			)
+
+			# Optimize the ONNX model
+			optimized_onnx = ONNXExporter.optimize_onnx_model(onnx_path)
+
+			# Build TensorRT engine if available
+			if TRT_AVAILABLE:
+				# Define input shapes for TensorRT engine
+				input_shapes = {
+					"input_text": [(1,), (1,), (8,)]  # min, opt, max batch sizes
+				}
+
+				self.trt_engine.build_engine(
+					optimized_onnx,
+					engine_path,
+					fp16_mode=True,
+					input_shapes=input_shapes
+				)
+
+			# Mark as exported
+			self.exported_models["t5_encoder"] = onnx_path
+
+		# Use ONNX/TensorRT inference if available and requested
+		if use_onnx and (os.path.exists(onnx_path) or os.path.exists(engine_path)):
+			if TRT_AVAILABLE and os.path.exists(engine_path):
+				# Use TensorRT for inference
+				print("Using TensorRT for T5 encoding")
+				engine = self.trt_engine.load_engine(engine_path)
+				inputs, outputs, bindings = self.trt_engine.allocate_buffers(engine)
+
+				# Prepare input data
+				input_data = {
+					"input_text": np.array([positive_prompt])
+				}
+
+				# Run inference
+				result = self.trt_engine.infer(engine, inputs, outputs, bindings, input_data)
+				context = [torch.from_numpy(result["output_embeds"]).to(self.device)]
+
+				# Run again for negative prompt
+				input_data = {
+					"input_text": np.array([negative_prompt])
+				}
+				result = self.trt_engine.infer(engine, inputs, outputs, bindings, input_data)
+				context_null = [torch.from_numpy(result["output_embeds"]).to(self.device)]
+
+			elif os.path.exists(onnx_path):
+				# Use ONNX Runtime for inference
+				print("Using ONNX Runtime for T5 encoding")
+				session_options = ort.SessionOptions()
+				session = ort.InferenceSession(onnx_path, sess_options=session_options)
+
+				# Run for positive prompt
+				ort_inputs = {
+					"input_text": np.array([positive_prompt])
+				}
+				ort_outputs = session.run(None, ort_inputs)
+				context = [torch.from_numpy(ort_outputs[0]).to(self.device)]
+
+				# Run for negative prompt
+				ort_inputs = {
+					"input_text": np.array([negative_prompt])
+				}
+				ort_outputs = session.run(None, ort_inputs)
+				context_null = [torch.from_numpy(ort_outputs[0]).to(self.device)]
+		else:
+			# Use original PyTorch implementation
+			# Move encoder to device for processing
+			encoder.model.to(self.device)
+
+			with torch.autocast(device_type=self.device.split(':')[0], dtype=dtype, enabled=True):
+				context = encoder([positive_prompt], self.device)
+				context_null = encoder([negative_prompt], self.device)
+
+			context = [t.to(self.device) for t in context]
+			context_null = [t.to(self.device) for t in context_null]
+
+			# Aggressively offload when done
+			if force_offload:
+				encoder.model.to(self.offload_device)
+				soft_empty_cache()
 
 		return {
 			"prompt_embeds": context,
@@ -455,7 +827,8 @@ class WanVideoGenerator:
 		}
 
 	def encode_image_clip(self, clip, vae, image, num_frames, generation_width, generation_height,
-	                      force_offload=True, noise_aug_strength=0.0, latent_strength=1.0, clip_embed_strength=1.0):
+	                      force_offload=True, noise_aug_strength=0.0, latent_strength=1.0, clip_embed_strength=1.0,
+	                      use_onnx=False):
 		"""Encode an image using CLIP and prepare it for I2V processing."""
 		print(f"Encoding input image with CLIP, generating {num_frames} frames...")
 
@@ -527,20 +900,98 @@ class WanVideoGenerator:
 
 			return image
 
-		# Process with CLIP and immediately offload
-		clip.model.to(self.device)
+		# Check if CLIP encoder has been exported to ONNX
+		clip_onnx_path = os.path.join(self.onnx_dir, "clip_encoder.onnx")
+		clip_engine_path = clip_onnx_path.replace(".onnx", ".engine")
+
+		if use_onnx and not os.path.exists(clip_onnx_path) and not "clip_encoder" in self.exported_models:
+			# Export CLIP model to ONNX
+			print("Exporting CLIP visual encoder to ONNX...")
+
+			# First make sure the model is on the correct device
+			clip.model.to(self.device)
+
+			# Create dummy input for ONNX export - a single 224x224 image
+			dummy_input = torch.randn(1, 3, 224, 224, device=self.device)
+
+			# Export the visual part of CLIP
+			onnx_model = ONNXExporter.export_model(
+				clip.visual,
+				dummy_input,
+				clip_onnx_path,
+				input_names=["input_image"],
+				output_names=["output_features"],
+				dynamic_axes={
+					"input_image": {0: "batch_size"},
+					"output_features": {0: "batch_size"}
+				}
+			)
+
+			# Optimize the ONNX model
+			optimized_onnx = ONNXExporter.optimize_onnx_model(clip_onnx_path)
+
+			# Build TensorRT engine if available
+			if TRT_AVAILABLE:
+				# Define input shapes for TensorRT engine
+				input_shapes = {
+					"input_image": [(1, 3, 224, 224), (1, 3, 224, 224), (8, 3, 224, 224)]  # min, opt, max dimensions
+				}
+
+				self.trt_engine.build_engine(
+					optimized_onnx,
+					clip_engine_path,
+					fp16_mode=True,
+					input_shapes=input_shapes
+				)
+
+			# Mark as exported
+			self.exported_models["clip_encoder"] = clip_onnx_path
+
+		# Process with CLIP or ONNX/TensorRT
+		# Pre-process the image
 		pixel_values = clip_preprocess(image.to(self.device), size=224, mean=image_mean, std=image_std,
 		                               crop=True).float()
 
-		# Use CLIP to get embeddings
-		with torch.no_grad(), torch.cuda.amp.autocast():
-			clip_context = clip.visual(pixel_values)
+		# Use ONNX/TensorRT for inference if available and requested
+		if use_onnx and (os.path.exists(clip_onnx_path) or os.path.exists(clip_engine_path)):
+			if TRT_AVAILABLE and os.path.exists(clip_engine_path):
+				# Use TensorRT for inference
+				print("Using TensorRT for CLIP encoding")
+				engine = self.trt_engine.load_engine(clip_engine_path)
+				inputs, outputs, bindings = self.trt_engine.allocate_buffers(engine)
+
+				# Prepare input data
+				input_data = {
+					"input_image": pixel_values.cpu().numpy()
+				}
+
+				# Run inference
+				result = self.trt_engine.infer(engine, inputs, outputs, bindings, input_data)
+				clip_context = torch.from_numpy(result["output_features"]).to(self.device)
+
+			elif os.path.exists(clip_onnx_path):
+				# Use ONNX Runtime for inference
+				print("Using ONNX Runtime for CLIP encoding")
+				session_options = ort.SessionOptions()
+				session = ort.InferenceSession(clip_onnx_path, sess_options=session_options)
+
+				# Run inference
+				ort_inputs = {
+					"input_image": pixel_values.cpu().numpy()
+				}
+				ort_outputs = session.run(None, ort_inputs)
+				clip_context = torch.from_numpy(ort_outputs[0]).to(self.device)
+		else:
+			# Use original PyTorch model
+			clip.model.to(self.device)
+			with torch.no_grad(), torch.cuda.amp.autocast():
+				clip_context = clip.visual(pixel_values)
 
 		if clip_embed_strength != 1.0:
 			clip_context *= clip_embed_strength
 
 		# Immediately offload CLIP model
-		if force_offload:
+		if force_offload and not use_onnx:
 			clip.model.to(self.offload_device)
 			soft_empty_cache()
 
@@ -577,6 +1028,65 @@ class WanVideoGenerator:
 		# Round up to nearest multiple of sp_size
 		max_seq_len = int(math.ceil(raw_seq_len / sp_size)) * sp_size
 
+		# Check if VAE encoder has been exported to ONNX
+		vae_encoder_onnx_path = os.path.join(self.onnx_dir, "vae_encoder.onnx")
+		vae_encoder_engine_path = vae_encoder_onnx_path.replace(".onnx", ".engine")
+
+		if use_onnx and not os.path.exists(vae_encoder_onnx_path) and not "vae_encoder" in self.exported_models:
+			# Export VAE encoder to ONNX
+			print("Exporting VAE encoder to ONNX...")
+
+			# First make sure the VAE is on the correct device
+			vae.to(self.device)
+
+			# Create dummy input for ONNX export
+			# Shape should match expected input [C, B, H, W]
+			dummy_input = [torch.randn(3, 1, h, w, device=self.device)]
+
+			# Create a wrapper model for the encoder part
+			class VAEEncoderWrapper(torch.nn.Module):
+				def __init__(self, vae):
+					super().__init__()
+					self.vae = vae
+
+				def forward(self, x):
+					return self.vae.encode(x, self.vae.device)[0]
+
+			vae_encoder_wrapper = VAEEncoderWrapper(vae)
+
+			# Export the VAE encoder
+			onnx_model = ONNXExporter.export_model(
+				vae_encoder_wrapper,
+				dummy_input,
+				vae_encoder_onnx_path,
+				input_names=["input_frames"],
+				output_names=["latent"],
+				dynamic_axes={
+					"input_frames": {1: "batch", 2: "height", 3: "width"},
+					"latent": {1: "batch", 2: "latent_height", 3: "latent_width"}
+				}
+			)
+
+			# Optimize the ONNX model
+			optimized_onnx = ONNXExporter.optimize_onnx_model(vae_encoder_onnx_path)
+
+			# Build TensorRT engine if available
+			if TRT_AVAILABLE:
+				# Define input shapes for TensorRT engine
+				input_shapes = {
+					"input_frames": [(3, 1, 64, 64), (3, 1, h, w), (3, 16, 1024, 1024)]  # min, opt, max dimensions
+				}
+
+				self.trt_engine.build_engine(
+					optimized_onnx,
+					vae_encoder_engine_path,
+					fp16_mode=True,
+					input_shapes=input_shapes
+				)
+
+			# Mark as exported
+			self.exported_models["vae_encoder"] = vae_encoder_onnx_path
+
 		# Process through VAE
 		vae.to(self.device)
 
@@ -604,12 +1114,46 @@ class WanVideoGenerator:
 		zero_frames = torch.zeros(3, num_frames - 1, h, w, device=self.device)
 
 		# Now both tensors have compatible dimensions for concatenation
-		# Use mixed precision encoding to save memory
-		with torch.cuda.amp.autocast():
-			concatenated = torch.concat([resized_image, zero_frames], dim=1).to(dtype=vae.dtype)
-			concatenated *= latent_strength
-			y = vae.encode([concatenated], self.device)[0]
-			y = torch.concat([mask, y])
+		concatenated = torch.concat([resized_image, zero_frames], dim=1).to(dtype=vae.dtype)
+		concatenated *= latent_strength
+
+		# Use ONNX/TensorRT for VAE encoding if available and requested
+		if use_onnx and (os.path.exists(vae_encoder_onnx_path) or os.path.exists(vae_encoder_engine_path)):
+			if TRT_AVAILABLE and os.path.exists(vae_encoder_engine_path):
+				# Use TensorRT for inference
+				print("Using TensorRT for VAE encoding")
+				engine = self.trt_engine.load_engine(vae_encoder_engine_path)
+				inputs, outputs, bindings = self.trt_engine.allocate_buffers(engine)
+
+				# Prepare input data - need to reshape to match expected input
+				input_data = {
+					"input_frames": [concatenated.cpu().numpy()]
+				}
+
+				# Run inference
+				result = self.trt_engine.infer(engine, inputs, outputs, bindings, input_data)
+				y = torch.from_numpy(result["latent"]).to(self.device)
+
+			elif os.path.exists(vae_encoder_onnx_path):
+				# Use ONNX Runtime for inference
+				print("Using ONNX Runtime for VAE encoding")
+				session_options = ort.SessionOptions()
+				session = ort.InferenceSession(vae_encoder_onnx_path, sess_options=session_options)
+
+				# Run inference
+				ort_inputs = {
+					"input_frames": [concatenated.cpu().numpy()]
+				}
+				ort_outputs = session.run(None, ort_inputs)
+				y = torch.from_numpy(ort_outputs[0]).to(self.device)
+		else:
+			# Use original PyTorch VAE encoder
+			# Use mixed precision encoding to save memory
+			with torch.cuda.amp.autocast():
+				y = vae.encode([concatenated], self.device)[0]
+
+		# Combine mask and encoded latent
+		y = torch.concat([mask, y])
 
 		# Clear VAE cache and move back to offload device
 		vae.model.clear_cache()
@@ -646,29 +1190,296 @@ class WanVideoGenerator:
 			"num_frames": num_frames
 		}
 
+	def export_unet_to_onnx(self, model_info, max_seq_len, num_frames, lat_h, lat_w, use_dynamic_axes=True):
+		"""Export the diffusion UNet model to ONNX."""
+		print("Exporting diffusion model to ONNX...")
+
+		transformer = model_info["model"]
+		model_type = model_info["model_type"]
+		base_name = os.path.splitext(os.path.basename(model_info["model_path"]))[0]
+
+		# Create output directory for the ONNX model
+		onnx_path = os.path.join(self.onnx_dir, f"{base_name}_unet.onnx")
+		engine_path = onnx_path.replace(".onnx", ".engine")
+
+		# Check if already exported
+		if "diffusion_model" in self.exported_models:
+			return self.exported_models["diffusion_model"]
+
+		# Check if files already exist
+		if os.path.exists(onnx_path) or os.path.exists(engine_path):
+			if os.path.exists(engine_path):
+				self.exported_models["diffusion_model"] = engine_path
+				return engine_path
+			else:
+				self.exported_models["diffusion_model"] = onnx_path
+				return onnx_path
+
+		# Move model to device
+		transformer.to(self.device)
+		transformer.eval()
+
+		# Create dummy inputs based on model type
+		if model_type == "i2v":
+			# For Image to Video, we need image embeddings and CLIP context
+			# Create dummy tensors for each input
+			latent = torch.randn(1, 16, num_frames // 4, lat_h, lat_w, device=self.device)
+			t = torch.tensor([500], device=self.device)  # Example timestep
+			clip_fea = torch.randn(1, 1024, device=self.device)  # CLIP features
+			context = [torch.randn(1, 512, 2048, device=self.device)]  # T5 text context
+			y = [torch.randn(5, num_frames // 4, lat_h, lat_w, device=self.device)]  # Image embeddings
+
+			# Configure dynamic axes for ONNX export
+			dynamic_axes = {
+				"latent": {0: "batch_size", 2: "frames", 3: "height", 4: "width"},
+				"timestep": {},  # Scalar
+				"clip_features": {0: "batch_size"},
+				"context": {0: "batch_size", 1: "seq_len"},
+				"image_embeddings": {1: "frames", 2: "height", 3: "width"},
+				"output": {0: "batch_size", 2: "frames", 3: "height", 4: "width"}
+			}
+
+			# Create a wrapper class for ONNX export
+			class UNetWrapperI2V(torch.nn.Module):
+				def __init__(self, model):
+					super().__init__()
+					self.model = model
+
+				def forward(self, latent, timestep, clip_features, context, image_embeddings):
+					# Call the model with appropriate arguments
+					return self.model(
+						latent,
+						t=timestep,
+						clip_fea=clip_features,
+						context=[context],
+						y=[image_embeddings],
+						seq_len=max_seq_len,
+						device=latent.device,
+						freqs=None  # Will be generated inside the model
+					)
+
+			# Create the wrapper model
+			wrapper_model = UNetWrapperI2V(transformer)
+
+			# Input names and example inputs
+			input_names = ["latent", "timestep", "clip_features", "context", "image_embeddings"]
+			output_names = ["output"]
+			example_inputs = (latent, t, clip_fea, context[0], y[0])
+
+		else:  # t2v
+			# For Text to Video, we need only text context
+			# Create dummy tensors
+			latent = torch.randn(1, 16, num_frames // 4, lat_h, lat_w, device=self.device)
+			t = torch.tensor([500], device=self.device)  # Example timestep
+			context = [torch.randn(1, 512, 2048, device=self.device)]  # T5 text context
+
+			# Configure dynamic axes for ONNX export
+			dynamic_axes = {
+				"latent": {0: "batch_size", 2: "frames", 3: "height", 4: "width"},
+				"timestep": {},  # Scalar
+				"context": {0: "batch_size", 1: "seq_len"},
+				"output": {0: "batch_size", 2: "frames", 3: "height", 4: "width"}
+			}
+
+			# Create a wrapper class for ONNX export
+			class UNetWrapperT2V(torch.nn.Module):
+				def __init__(self, model):
+					super().__init__()
+					self.model = model
+
+				def forward(self, latent, timestep, context):
+					# Call the model with appropriate arguments
+					return self.model(
+						latent,
+						t=timestep,
+						context=[context],
+						seq_len=max_seq_len,
+						device=latent.device,
+						freqs=None  # Will be generated inside the model
+					)
+
+			# Create the wrapper model
+			wrapper_model = UNetWrapperT2V(transformer)
+
+			# Input names and example inputs
+			input_names = ["latent", "timestep", "context"]
+			output_names = ["output"]
+			example_inputs = (latent, t, context[0])
+
+		# Export the model to ONNX
+		if not use_dynamic_axes:
+			dynamic_axes = None
+
+		try:
+			onnx_path = ONNXExporter.export_model(
+				wrapper_model,
+				example_inputs,
+				onnx_path,
+				input_names=input_names,
+				output_names=output_names,
+				dynamic_axes=dynamic_axes
+			)
+
+			# Optimize the ONNX model
+			optimized_onnx = ONNXExporter.optimize_onnx_model(onnx_path)
+
+			# Build TensorRT engine if available
+			if TRT_AVAILABLE:
+				# Define input shapes - example only, would need adjustment for real use
+				if model_type == "i2v":
+					input_shapes = {
+						"latent": [(1, 16, num_frames // 4, lat_h, lat_w),
+						           (1, 16, num_frames // 4, lat_h, lat_w),
+						           (2, 16, num_frames // 4 * 2, lat_h * 2, lat_w * 2)],
+						"clip_features": [(1, 1024), (1, 1024), (2, 1024)],
+						"context": [(1, 512, 2048), (1, 512, 2048), (2, 512, 2048)],
+						"image_embeddings": [(5, num_frames // 4, lat_h, lat_w),
+						                     (5, num_frames // 4, lat_h, lat_w),
+						                     (5, num_frames // 4 * 2, lat_h * 2, lat_w * 2)]
+					}
+				else:
+					input_shapes = {
+						"latent": [(1, 16, num_frames // 4, lat_h, lat_w),
+						           (1, 16, num_frames // 4, lat_h, lat_w),
+						           (2, 16, num_frames // 4 * 2, lat_h * 2, lat_w * 2)],
+						"context": [(1, 512, 2048), (1, 512, 2048), (2, 512, 2048)]
+					}
+
+				self.trt_engine.build_engine(
+					optimized_onnx,
+					engine_path,
+					fp16_mode=True,
+					input_shapes=input_shapes
+				)
+
+				if os.path.exists(engine_path):
+					path = engine_path
+				else:
+					path = optimized_onnx
+			else:
+				path = optimized_onnx
+
+			self.exported_models["diffusion_model"] = path
+			return path
+
+		except Exception as e:
+			print(f"Error exporting UNet model to ONNX: {e}")
+			return None
+
+	def export_vae_decoder_to_onnx(self, vae, latents_shape):
+		"""Export the VAE decoder to ONNX."""
+		print("Exporting VAE decoder to ONNX...")
+
+		vae_decoder_onnx_path = os.path.join(self.onnx_dir, "vae_decoder.onnx")
+		vae_decoder_engine_path = vae_decoder_onnx_path.replace(".onnx", ".engine")
+
+		# Check if already exported
+		if "vae_decoder" in self.exported_models:
+			return self.exported_models["vae_decoder"]
+
+		# Check if files already exist
+		if os.path.exists(vae_decoder_onnx_path) or os.path.exists(vae_decoder_engine_path):
+			if os.path.exists(vae_decoder_engine_path):
+				self.exported_models["vae_decoder"] = vae_decoder_engine_path
+				return vae_decoder_engine_path
+			else:
+				self.exported_models["vae_decoder"] = vae_decoder_onnx_path
+				return vae_decoder_onnx_path
+
+		# Move VAE to device
+		vae.to(self.device)
+		vae.eval()
+
+		# Create dummy input for the decoder
+		dummy_latent = torch.randn(*latents_shape, device=self.device)
+
+		# Create a wrapper class for the decoder
+		class VAEDecoderWrapper(torch.nn.Module):
+			def __init__(self, vae):
+				super().__init__()
+				self.vae = vae
+
+			def forward(self, latent):
+				return self.vae.decode(latent, self.vae.device)[0]
+
+		vae_decoder_wrapper = VAEDecoderWrapper(vae)
+
+		# Configure dynamic axes
+		dynamic_axes = {
+			"latent": {0: "batch_size", 2: "frames", 3: "latent_height", 4: "latent_width"},
+			"output": {0: "batch_size", 2: "frames", 3: "height", 4: "width"}
+		}
+
+		try:
+			# Export the model to ONNX
+			onnx_path = ONNXExporter.export_model(
+				vae_decoder_wrapper,
+				dummy_latent,
+				vae_decoder_onnx_path,
+				input_names=["latent"],
+				output_names=["output"],
+				dynamic_axes=dynamic_axes
+			)
+
+			# Optimize the ONNX model
+			optimized_onnx = ONNXExporter.optimize_onnx_model(vae_decoder_onnx_path)
+
+			# Build TensorRT engine if available
+			if TRT_AVAILABLE:
+				# Define input shapes
+				input_shapes = {
+					"latent": [
+						(1, 16, 1, 8, 8),  # min
+						latents_shape,  # opt
+						(2, 16, 40, 64, 64)  # max - would adjust based on your use case
+					]
+				}
+
+				self.trt_engine.build_engine(
+					optimized_onnx,
+					vae_decoder_engine_path,
+					fp16_mode=True,
+					input_shapes=input_shapes
+				)
+
+				if os.path.exists(vae_decoder_engine_path):
+					path = vae_decoder_engine_path
+				else:
+					path = optimized_onnx
+			else:
+				path = optimized_onnx
+
+			self.exported_models["vae_decoder"] = path
+			return path
+
+		except Exception as e:
+			print(f"Error exporting VAE decoder to ONNX: {e}")
+			return None
+
 	def sample(self, model_info, text_embeds, image_embeds, shift, steps, cfg, seed=None,
 	           scheduler="dpm++", riflex_freq_index=0, force_offload=True,
-	           samples=None, denoise_strength=1.0):
+	           samples=None, denoise_strength=1.0, use_onnx=False):
 		"""
-        Run the sampling process to generate the video.
+		Run the sampling process to generate the video.
 
-        Args:
-            model_info: The loaded diffusion model info
-            text_embeds: Encoded text prompts
-            image_embeds: Encoded image or empty embeds
-            shift: Shift parameter for the scheduler
-            steps: Number of denoising steps
-            cfg: Classifier-free guidance scale
-            seed: Random seed (if None, a random seed will be generated)
-            scheduler: Sampling scheduler to use
-            riflex_freq_index: Frequency index for RIFLEX
-            force_offload: Whether to offload models after use
-            samples: Initial latents for video2video
-            denoise_strength: Strength of denoising (for video2video)
+		Args:
+			model_info: The loaded diffusion model info
+			text_embeds: Encoded text prompts
+			image_embeds: Encoded image or empty embeds
+			shift: Shift parameter for the scheduler
+			steps: Number of denoising steps
+			cfg: Classifier-free guidance scale
+			seed: Random seed (if None, a random seed will be generated)
+			scheduler: Sampling scheduler to use
+			riflex_freq_index: Frequency index for RIFLEX
+			force_offload: Whether to offload models after use
+			samples: Initial latents for video2video
+			denoise_strength: Strength of denoising (for video2video)
+			use_onnx: Whether to use ONNX/TensorRT for inference
 
-        Returns:
-            Generated video latents
-        """
+		Returns:
+			Generated video latents
+		"""
 		print(f"Running sampling for {steps} steps with {scheduler} scheduler...")
 
 		if seed is None:
@@ -677,6 +1488,7 @@ class WanVideoGenerator:
 		print(f"Using seed: {seed}")
 
 		transformer = model_info["model"]
+		model_type = model_info["model_type"]
 
 		# Adjust steps based on denoise strength
 		steps = int(steps / denoise_strength)
@@ -717,7 +1529,7 @@ class WanVideoGenerator:
 		seed_g = torch.Generator(device=torch.device("cpu"))
 		seed_g.manual_seed(seed)
 
-		if transformer.model_type == "i2v":
+		if model_type == "i2v":
 			lat_h = image_embeds.get("lat_h", None)
 			lat_w = image_embeds.get("lat_w", None)
 			if lat_h is None or lat_w is None:
@@ -757,6 +1569,26 @@ class WanVideoGenerator:
 		# Initialize latent on CPU first, then move to GPU when needed
 		latent = noise
 
+		# Export model to ONNX if using ONNX and not already exported
+		if use_onnx and not "diffusion_model" in self.exported_models:
+			if model_type == "i2v":
+				self.export_unet_to_onnx(
+					model_info,
+					seq_len,
+					image_embeds["num_frames"],
+					image_embeds["lat_h"],
+					image_embeds["lat_w"]
+				)
+			else:
+				# For T2V, use target_shape parameters
+				self.export_unet_to_onnx(
+					model_info,
+					seq_len,
+					image_embeds["num_frames"],
+					image_embeds["target_shape"][2],  # height
+					image_embeds["target_shape"][3]  # width
+				)
+
 		# Set up rope parameters
 		d = transformer.dim // transformer.num_heads
 		freqs = torch.cat([
@@ -777,7 +1609,7 @@ class WanVideoGenerator:
 			'freqs': freqs,
 		}
 
-		if transformer.model_type == "i2v":
+		if model_type == "i2v":
 			base_args.update({
 				'y': [image_embeds["image_embeds"]],
 			})
@@ -788,87 +1620,183 @@ class WanVideoGenerator:
 		arg_null = base_args.copy()
 		arg_null.update({'context': text_embeds["negative_prompt_embeds"]})
 
-		# Handle block swapping - crucial for memory efficiency in ComfyUI
-		if model_info["block_swap_args"] is not None:
-			# Only load non-block parameters to GPU
-			for name, param in transformer.named_parameters():
-				if "block" not in name:
-					param.data = param.data.to(self.device)
+		# Check if we should use ONNX/TensorRT for inference
+		use_engine = use_onnx and "diffusion_model" in self.exported_models
 
-			# Use block swapping (loads only necessary blocks during inference)
-			transformer.block_swap(
-				model_info["block_swap_args"]["blocks_to_swap"] - 1,
-			)
-		else:
-			if model_info["manual_offloading"]:
-				transformer.to(self.device)
+		if use_engine:
+			engine_path = self.exported_models["diffusion_model"]
+			if TRT_AVAILABLE and engine_path.endswith(".engine"):
+				print("Using TensorRT engine for diffusion model inference")
+				engine = self.trt_engine.load_engine(engine_path)
+				inputs, outputs, bindings = self.trt_engine.allocate_buffers(engine)
+			elif engine_path.endswith(".onnx"):
+				print("Using ONNX Runtime for diffusion model inference")
+				session_options = ort.SessionOptions()
+				session = ort.InferenceSession(engine_path, sess_options=session_options)
+
+		# Handle block swapping - crucial for memory efficiency in ComfyUI
+		if not use_engine:
+			if model_info["block_swap_args"] is not None:
+				# Only load non-block parameters to GPU
+				for name, param in transformer.named_parameters():
+					if "block" not in name:
+						param.data = param.data.to(self.device)
+
+				# Use block swapping (loads only necessary blocks during inference)
+				transformer.block_swap(
+					model_info["block_swap_args"]["blocks_to_swap"] - 1,
+				)
+			else:
+				if model_info["manual_offloading"]:
+					transformer.to(self.device)
 
 		soft_empty_cache()
 
 		# Turn off gradients for memory efficiency
-		# Replace your current sampling loop with this optimized version
 		with torch.no_grad():
+			# Enable mixed precision for memory efficiency
 			with torch.autocast(device_type=self.device.split(':')[0], dtype=model_info["dtype"], enabled=True):
-				# Pre-allocate tensors and initialize block manager
-				latent_gpu = torch.zeros_like(latent, device=self.device)
-				block_manager = BlockSwapManager(transformer, blocks_to_swap, self.device, self.offload_device)
+				for i, t in enumerate(tqdm(timesteps)):
+					# Only move latent to GPU during processing - like ComfyUI
+					latent_gpu = latent.to(self.device)
+					latent_model_input = [latent_gpu]
+					timestep = torch.tensor([t], device=self.device)
 
-				# Process timesteps in batches where possible
-				timestep_batches = []
-				batch_size = min(4, len(timesteps))  # Group timesteps into small batches
-				for i in range(0, len(timesteps), batch_size):
-					timestep_batches.append(timesteps[i:i + batch_size])
-
-				for batch_idx, timestep_batch in enumerate(tqdm(timestep_batches)):
-					# Prepare for batch processing
-					start_layer = 0
-					end_layer = transformer.num_layers
-
-					# Activate early blocks for this timestep batch
-					block_manager.activate_sequential_blocks(0, min(10, transformer.num_layers))
-
-					# Process each timestep in small batches
-					for i, t in enumerate(timestep_batch):
-						# Copy latent to GPU
-						latent_gpu.copy_(latent.to(self.device))
-						latent_model_input = [latent_gpu]
-						timestep = torch.tensor([t], device=self.device)
-
-						# Get conditional prediction
+					# Get conditional noise prediction using PyTorch or ONNX/TensorRT
+					if use_engine:
+						if model_type == "i2v":
+							if TRT_AVAILABLE and engine_path.endswith(".engine"):
+								# Use TensorRT for inference
+								input_data = {
+									"latent": latent_model_input[0].unsqueeze(0).cpu().numpy(),
+									"timestep": timestep.cpu().numpy(),
+									"clip_features": image_embeds["clip_context"].cpu().numpy(),
+									"context": text_embeds["prompt_embeds"][0].cpu().numpy(),
+									"image_embeddings": image_embeds["image_embeds"].cpu().numpy()
+								}
+								result = self.trt_engine.infer(engine, inputs, outputs, bindings, input_data)
+								noise_pred_cond = torch.from_numpy(result["output"]).squeeze(0).to(self.device)
+							else:
+								# Use ONNX Runtime for inference
+								ort_inputs = {
+									"latent": latent_model_input[0].unsqueeze(0).cpu().numpy(),
+									"timestep": timestep.cpu().numpy(),
+									"clip_features": image_embeds["clip_context"].cpu().numpy(),
+									"context": text_embeds["prompt_embeds"][0].cpu().numpy(),
+									"image_embeddings": image_embeds["image_embeds"].cpu().numpy()
+								}
+								ort_outputs = session.run(None, ort_inputs)
+								noise_pred_cond = torch.from_numpy(ort_outputs[0]).squeeze(0).to(self.device)
+						else:  # t2v
+							if TRT_AVAILABLE and engine_path.endswith(".engine"):
+								# Use TensorRT for inference
+								input_data = {
+									"latent": latent_model_input[0].unsqueeze(0).cpu().numpy(),
+									"timestep": timestep.cpu().numpy(),
+									"context": text_embeds["prompt_embeds"][0].cpu().numpy()
+								}
+								result = self.trt_engine.infer(engine, inputs, outputs, bindings, input_data)
+								noise_pred_cond = torch.from_numpy(result["output"]).squeeze(0).to(self.device)
+							else:
+								# Use ONNX Runtime for inference
+								ort_inputs = {
+									"latent": latent_model_input[0].unsqueeze(0).cpu().numpy(),
+									"timestep": timestep.cpu().numpy(),
+									"context": text_embeds["prompt_embeds"][0].cpu().numpy()
+								}
+								ort_outputs = session.run(None, ort_inputs)
+								noise_pred_cond = torch.from_numpy(ort_outputs[0]).squeeze(0).to(self.device)
+					else:
+						# Use original PyTorch model
 						noise_pred_cond = transformer(
 							latent_model_input, t=timestep, **arg_c)[0].to(self.offload_device)
 
-						# Apply CFG if needed
-						if cfg[batch_idx * batch_size + i] != 1.0:
-							# Reuse latent_gpu for unconditional pass
-							latent_gpu.copy_(latent.to(self.device))
-							latent_model_input = [latent_gpu]
+					# Free GPU memory
+					del latent_gpu
+					soft_empty_cache()
 
-							# Get unconditional prediction
+					if cfg[i] != 1.0:
+						# Move latent back to GPU for unconditional pass
+						latent_gpu = latent.to(self.device)
+						latent_model_input = [latent_gpu]
+
+						# Get unconditional noise prediction
+						if use_engine:
+							if model_type == "i2v":
+								if TRT_AVAILABLE and engine_path.endswith(".engine"):
+									# Use TensorRT for inference
+									input_data = {
+										"latent": latent_model_input[0].unsqueeze(0).cpu().numpy(),
+										"timestep": timestep.cpu().numpy(),
+										"clip_features": image_embeds["clip_context"].cpu().numpy(),
+										"context": text_embeds["negative_prompt_embeds"][0].cpu().numpy(),
+										"image_embeddings": image_embeds["image_embeds"].cpu().numpy()
+									}
+									result = self.trt_engine.infer(engine, inputs, outputs, bindings, input_data)
+									noise_pred_uncond = torch.from_numpy(result["output"]).squeeze(0).to(self.device)
+								else:
+									# Use ONNX Runtime for inference
+									ort_inputs = {
+										"latent": latent_model_input[0].unsqueeze(0).cpu().numpy(),
+										"timestep": timestep.cpu().numpy(),
+										"clip_features": image_embeds["clip_context"].cpu().numpy(),
+										"context": text_embeds["negative_prompt_embeds"][0].cpu().numpy(),
+										"image_embeddings": image_embeds["image_embeds"].cpu().numpy()
+									}
+									ort_outputs = session.run(None, ort_inputs)
+									noise_pred_uncond = torch.from_numpy(ort_outputs[0]).squeeze(0).to(self.device)
+							else:  # t2v
+								if TRT_AVAILABLE and engine_path.endswith(".engine"):
+									# Use TensorRT for inference
+									input_data = {
+										"latent": latent_model_input[0].unsqueeze(0).cpu().numpy(),
+										"timestep": timestep.cpu().numpy(),
+										"context": text_embeds["negative_prompt_embeds"][0].cpu().numpy()
+									}
+									result = self.trt_engine.infer(engine, inputs, outputs, bindings, input_data)
+									noise_pred_uncond = torch.from_numpy(result["output"]).squeeze(0).to(self.device)
+								else:
+									# Use ONNX Runtime for inference
+									ort_inputs = {
+										"latent": latent_model_input[0].unsqueeze(0).cpu().numpy(),
+										"timestep": timestep.cpu().numpy(),
+										"context": text_embeds["negative_prompt_embeds"][0].cpu().numpy()
+									}
+									ort_outputs = session.run(None, ort_inputs)
+									noise_pred_uncond = torch.from_numpy(ort_outputs[0]).squeeze(0).to(self.device)
+						else:
+							# Use original PyTorch model
 							noise_pred_uncond = transformer(
 								latent_model_input, t=timestep, **arg_null)[0].to(self.offload_device)
 
-							# Apply CFG
-							noise_pred = noise_pred_uncond + cfg[batch_idx * batch_size + i] * (
-									noise_pred_cond - noise_pred_uncond)
-						else:
-							noise_pred = noise_pred_cond
+						# Free GPU memory again
+						del latent_gpu
+						soft_empty_cache()
 
-						# Sample and update latent
-						noise_pred = noise_pred.to(self.device)
-						latent_gpu.copy_(latent.to(self.device))
+						# Compute weighted noise prediction
+						noise_pred = noise_pred_uncond + cfg[i] * (
+								noise_pred_cond - noise_pred_uncond)
+					else:
+						noise_pred = noise_pred_cond
 
-						# Perform sampling step
-						latent = sample_scheduler.step(
-							noise_pred.unsqueeze(0),
-							t,
-							latent_gpu.unsqueeze(0),
-							return_dict=False,
-							generator=seed_g)[0].squeeze(0).cpu()
+					# Move needed tensors to GPU for sampling step
+					noise_pred_gpu = noise_pred.to(self.device)
+					latent_gpu = latent.to(self.device)
 
-						# Clear intermediate tensors
-						del noise_pred
-						torch.cuda.synchronize()
+					# Perform sampling step
+					temp_x0 = sample_scheduler.step(
+						noise_pred_gpu.unsqueeze(0),
+						t,
+						latent_gpu.unsqueeze(0),
+						return_dict=False,
+						generator=seed_g)[0]
+
+					# Update latent and keep on CPU
+					latent = temp_x0.squeeze(0).cpu()
+
+					# Free GPU memory
+					del noise_pred_gpu, latent_gpu, latent_model_input, timestep
+					soft_empty_cache()
 
 		# Move final result to GPU for one last processing
 		latent_gpu = latent.to(self.device)
@@ -876,7 +1804,7 @@ class WanVideoGenerator:
 
 		# Clean up
 		del latent_gpu
-		if force_offload:
+		if force_offload and not use_engine:
 			if model_info["manual_offloading"]:
 				transformer.to(self.offload_device)
 			soft_empty_cache()
@@ -884,82 +1812,80 @@ class WanVideoGenerator:
 		return {"samples": result}
 
 	def decode(self, vae, samples, enable_vae_tiling=True,
-	           tile_x=272, tile_y=272, tile_stride_x=144, tile_stride_y=128):
-		"""Optimized decode function with overlap handling"""
+	           tile_x=272, tile_y=272, tile_stride_x=144, tile_stride_y=128,
+	           use_onnx=False):
+		"""Decode latents into video frames."""
 		print("Decoding video frames...")
 
 		soft_empty_cache()
 		latents = samples["samples"]
 
-		# Move VAE to device for decoding
-		vae.to(self.device)
+		# Export VAE decoder to ONNX if using ONNX and not already exported
+		if use_onnx and not "vae_decoder" in self.exported_models:
+			self.export_vae_decoder_to_onnx(vae, latents.shape)
 
-		# Calculate optimal tile configuration
-		frames, channels, height, width = latents.shape
+		# Check if we should use ONNX/TensorRT for decoding
+		use_engine = use_onnx and "vae_decoder" in self.exported_models
 
-		# Use adaptive tiling based on available memory
-		if enable_vae_tiling:
-			free_memory = torch.cuda.get_device_properties(self.device).total_memory - torch.cuda.memory_allocated(
-				self.device)
-			free_memory_gb = free_memory / (1024 ** 3)
+		if use_engine:
+			engine_path = self.exported_models["vae_decoder"]
+			if TRT_AVAILABLE and engine_path.endswith(".engine"):
+				print("Using TensorRT engine for VAE decoding")
+				engine = self.trt_engine.load_engine(engine_path)
+				inputs, outputs, bindings = self.trt_engine.allocate_buffers(engine)
 
-			# Adjust tile size based on available memory
-			if free_memory_gb > 8:
-				# More memory available, use larger tiles
-				tile_x = min(tile_x * 2, width)
-				tile_y = min(tile_y * 2, height)
-			elif free_memory_gb < 2:
-				# Very limited memory, use smaller tiles
-				tile_x = max(tile_x // 2, 64)
-				tile_y = max(tile_y // 2, 64)
+				# Move latents to device
+				latents_gpu = latents.to(device=self.device, dtype=vae.dtype)
 
-			# Ensure stride is appropriate for tile size
-			tile_stride_x = min(tile_stride_x, tile_x // 2)
-			tile_stride_y = min(tile_stride_y, tile_y // 2)
+				# Run inference
+				input_data = {
+					"latent": latents_gpu.cpu().numpy()
+				}
+				result = self.trt_engine.infer(engine, inputs, outputs, bindings, input_data)
+				image = torch.from_numpy(result["output"]).to(self.device)
 
-		# Process in frame batches to reduce memory peaks
-		batch_size = 1
-		if frames <= 16:
-			batch_size = frames  # Process all at once for short videos
-		elif frames <= 64:
-			batch_size = 4  # Process in batches of 4 for medium videos
+			elif engine_path.endswith(".onnx"):
+				print("Using ONNX Runtime for VAE decoding")
+				session_options = ort.SessionOptions()
+				session = ort.InferenceSession(engine_path, sess_options=session_options)
+
+				# Move latents to device
+				latents_gpu = latents.to(device=self.device, dtype=vae.dtype)
+
+				# Run inference
+				ort_inputs = {
+					"latent": latents_gpu.cpu().numpy()
+				}
+				ort_outputs = session.run(None, ort_inputs)
+				image = torch.from_numpy(ort_outputs[0]).to(self.device)
 		else:
-			batch_size = 2  # Process in batches of 2 for long videos
+			# Use original PyTorch VAE decoder
+			# Move VAE to device for decoding
+			vae.to(self.device)
 
-		results = []
+			# Move latents to device
+			latents = latents.to(device=self.device, dtype=vae.dtype)
 
-		# Process in batches
-		for i in range(0, frames, batch_size):
-			end_idx = min(i + batch_size, frames)
-			batch = latents[i:end_idx].to(device=self.device, dtype=vae.dtype)
-
-			# Use mixed precision for decoding
+			# Use mixed precision for decoding to save memory
 			with torch.cuda.amp.autocast():
-				decoded_batch = vae.decode(
-					batch,
+				# Decode in tiles for memory efficiency
+				image = vae.decode(
+					latents,
 					device=self.device,
 					tiled=enable_vae_tiling,
 					tile_size=(tile_x, tile_y),
 					tile_stride=(tile_stride_x, tile_stride_y)
 				)[0]
 
-			# Normalize and format
-			decoded_batch = (decoded_batch - decoded_batch.min()) / (decoded_batch.max() - decoded_batch.min())
-			decoded_batch = torch.clamp(decoded_batch, 0.0, 1.0)
-			decoded_batch = decoded_batch.permute(1, 2, 3, 0).cpu().float()
+			# Clean up
+			vae.to(self.offload_device)
+			vae.model.clear_cache()
 
-			results.append(decoded_batch)
+		# Normalize and format
+		image = (image - image.min()) / (image.max() - image.min())
+		image = torch.clamp(image, 0.0, 1.0)
+		image = image.permute(1, 2, 3, 0).cpu().float()
 
-			# Clear batch from GPU
-			del batch, decoded_batch
-			soft_empty_cache()
-
-		# Concatenate results
-		image = torch.cat(results, dim=0)
-
-		# Clean up
-		vae.to(self.offload_device)
-		vae.model.clear_cache()
 		soft_empty_cache()
 
 		return image
@@ -1020,7 +1946,11 @@ class WanVideoGenerator:
 	                   # Output settings
 	                   save_path=None,
 	                   output_format="mp4",
-	                   fps=16
+	                   fps=16,
+
+	                   # ONNX/TensorRT settings
+	                   use_onnx=False,
+	                   export_onnx=False
 	                   ):
 		"""
 		Generate a video using the WanVideo model.
@@ -1089,9 +2019,6 @@ class WanVideoGenerator:
 		if input_image is not None and clip_path is None:
 			raise ValueError("No CLIP encoder found for I2V. Please specify clip_path.")
 
-		# Rest of the method remains unchanged
-		# ...
-
 		# 1. Load all required models
 		print("Loading models...")
 		model_info = self.load_model(
@@ -1129,7 +2056,8 @@ class WanVideoGenerator:
 			t5_encoder=t5_encoder,
 			positive_prompt=positive_prompt,
 			negative_prompt=negative_prompt,
-			force_offload=force_offload
+			force_offload=force_offload,
+			use_onnx=use_onnx
 		)
 
 		# 3. Prepare image embeds or empty embeds
@@ -1144,7 +2072,8 @@ class WanVideoGenerator:
 				force_offload=force_offload,
 				noise_aug_strength=noise_aug_strength,
 				latent_strength=latent_strength,
-				clip_embed_strength=clip_embed_strength
+				clip_embed_strength=clip_embed_strength,
+				use_onnx=use_onnx
 			)
 		else:
 			image_embeds = self.create_empty_embeds(
@@ -1166,7 +2095,8 @@ class WanVideoGenerator:
 			riflex_freq_index=riflex_freq_index,
 			force_offload=force_offload,
 			samples=input_video,
-			denoise_strength=denoise_strength
+			denoise_strength=denoise_strength,
+			use_onnx=use_onnx
 		)
 
 		# 5. Decode the video frames
@@ -1177,7 +2107,8 @@ class WanVideoGenerator:
 			tile_x=tile_x,
 			tile_y=tile_y,
 			tile_stride_x=tile_stride_x,
-			tile_stride_y=tile_stride_y
+			tile_stride_y=tile_stride_y,
+			use_onnx=use_onnx
 		)
 
 		print(f"Video generated successfully! Shape: {video_frames.shape}")
@@ -1197,35 +2128,6 @@ class WanVideoGenerator:
 
 		return video_frames
 
-	def save_video(self, video_frames, save_path, fps=16, format="mp4"):
-		"""Save video frames to a file."""
-		frames = (video_frames * 255).to(torch.uint8).numpy()
-
-		if format == "frames":
-			os.makedirs(save_path, exist_ok=True)
-			for i, frame in enumerate(frames):
-				img = Image.fromarray(frame)
-				img.save(os.path.join(save_path, f"frame_{i:05d}.png"))
-			return
-
-		try:
-			import imageio
-
-			if format == "gif":
-				imageio.mimsave(save_path, frames, fps=fps)
-			elif format == "mp4":
-				imageio.mimsave(save_path, frames, fps=fps, codec="libx264", quality=7)
-			else:
-				raise ValueError(f"Unsupported format: {format}")
-		except ImportError:
-			print("Please install imageio for video saving: pip install imageio imageio-ffmpeg")
-			# Fall back to saving frames
-			dir_path = os.path.splitext(save_path)[0] + "_frames"
-			os.makedirs(dir_path, exist_ok=True)
-			for i, frame in enumerate(frames):
-				img = Image.fromarray(frame)
-				img.save(os.path.join(dir_path, f"frame_{i:05d}.png"))
-
 
 def main():
 	parser = argparse.ArgumentParser(description="Generate videos with WanVideo models")
@@ -1239,7 +2141,6 @@ def main():
 	parser.add_argument("--num_frames", type=int, default=81, help="Number of frames to generate")
 	parser.add_argument("--steps", type=int, default=10, help="Number of sampling steps")
 	parser.add_argument("--cfg", type=float, default=6.0, help="Classifier-free guidance scale")
-	parser.add_argument("--shift", type=float, default=5.0, help="Scheduler shift parameter")
 	parser.add_argument("--shift", type=float, default=3.0, help="Scheduler shift parameter")
 	parser.add_argument("--seed", type=int, default=None, help="Random seed")
 	parser.add_argument("--scheduler", type=str, default="dpm++", choices=["dpm++", "dpm++_sde", "unipc"],
@@ -1249,7 +2150,6 @@ def main():
 	parser.add_argument("--noise_aug_strength", type=float, default=0.0, help="Noise augmentation strength for I2V")
 	parser.add_argument("--output", type=str, required=True, help="Output path for the video")
 	parser.add_argument("--fps", type=int, default=16, help="Frames per second for output video")
-
 	args = parser.parse_args()
 
 	# Specify paths to match ComfyUI workflow
@@ -1258,24 +2158,91 @@ def main():
 	t5_path = os.path.join(args.models_dir, "text_encoders", "umt5-xxl-enc-fp8_e4m3fn.safetensors")
 	clip_path = os.path.join(args.models_dir, "clip", "open-clip-xlm-roberta-large-vit-huge-14_fp16.safetensors")
 
+	# Define a fixed path for ONNX models
+	onnx_models_dir = os.path.join(args.models_dir, "onnx_models")
+	os.makedirs(onnx_models_dir, exist_ok=True)
+
+	# Check if files exist, otherwise search for them
+	if not os.path.exists(model_path):
+		model_files = glob.glob(os.path.join(args.models_dir, "*.safetensors"))
+		if model_files:
+			model_path = model_files[0]
+			print(f"Using model: {model_path}")
+
+	if not os.path.exists(vae_path):
+		vae_files = glob.glob(os.path.join(args.models_dir, "vae", "*.safetensors"))
+		if vae_files:
+			vae_path = vae_files[0]
+			print(f"Using VAE: {vae_path}")
+
+	if not os.path.exists(t5_path):
+		t5_files = glob.glob(os.path.join(args.models_dir, "text_encoders", "*.safetensors"))
+		if not t5_files:
+			t5_files = glob.glob(os.path.join(args.models_dir, "t5", "*.safetensors"))
+		if t5_files:
+			t5_path = t5_files[0]
+			print(f"Using T5: {t5_path}")
+
+	if not os.path.exists(clip_path) and args.input_image:
+		clip_files = glob.glob(os.path.join(args.models_dir, "clip", "*.safetensors"))
+		if clip_files:
+			clip_path = clip_files[0]
+			print(f"Using CLIP: {clip_path}")
+
 	# Clear CUDA cache before starting
 	torch.cuda.empty_cache()
 	gc.collect()
-
 	print(f"Initial VRAM: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
 
-	# Create generator with explicit device
+	# Create generator with explicit device and use our custom ONNX dir
 	generator = WanVideoGenerator(
 		models_dir=args.models_dir,
 		device=args.device
 	)
+	# Set the ONNX directory
+	generator.onnx_dir = onnx_models_dir
+
+	# Check if ONNX models exist, if not, create them
+	onnx_models_exist = all([
+		any(glob.glob(os.path.join(onnx_models_dir, "*unet*.onnx"))) or
+		any(glob.glob(os.path.join(onnx_models_dir, "*unet*.engine"))),
+		any(glob.glob(os.path.join(onnx_models_dir, "*vae_decoder*.onnx"))) or
+		any(glob.glob(os.path.join(onnx_models_dir, "*vae_decoder*.engine"))),
+		any(glob.glob(os.path.join(onnx_models_dir, "*t5_encoder*.onnx"))) or
+		any(glob.glob(os.path.join(onnx_models_dir, "*t5_encoder*.engine"))),
+	])
+
+	# Add CLIP check only if we're using an image input
+	if args.input_image:
+		onnx_models_exist = onnx_models_exist and (
+				any(glob.glob(os.path.join(onnx_models_dir, "*clip*.onnx"))) or
+				any(glob.glob(os.path.join(onnx_models_dir, "*clip*.engine")))
+		)
+
+	# If ONNX models don't exist, export them
+	if not onnx_models_exist:
+		print("ONNX models not found. Converting models to ONNX format...")
+		generator.export_models(
+			model_path=model_path,
+			vae_path=vae_path,
+			t5_path=t5_path,
+			clip_path=clip_path if args.input_image else None,
+			width=args.width,
+			height=args.height,
+			num_frames=args.num_frames,
+			export_path=onnx_models_dir
+		)
+		print("ONNX conversion complete.")
 
 	# Load input image if provided
 	input_img = None
 	if args.input_image:
 		input_img = Image.open(args.input_image).convert("RGB")
 
-	# Generate video with our custom FP8 implementation
+	# Determine whether to use ONNX/TensorRT based on availability
+	use_onnx = TRT_AVAILABLE or onnx_models_exist
+
+	# Generate video with our TensorRT/ONNX implementation if available, otherwise use PyTorch
 	generator.generate_video(
 		model_path=model_path,
 		vae_path=vae_path,
@@ -1285,7 +2252,7 @@ def main():
 		vae_precision="bf16",
 		t5_precision="bf16",
 		clip_precision="fp16",
-		quantization="fp8_e4m3fn",  # Use our custom FP8 implementation
+		quantization="disabled" if use_onnx else "fp8_e4m3fn",  # Disable custom FP8 if using ONNX
 		attention_mode="sdpa",
 		blocks_to_swap=args.blocks_to_swap,
 		positive_prompt=args.positive_prompt,
@@ -1302,7 +2269,8 @@ def main():
 		input_image=input_img,
 		noise_aug_strength=args.noise_aug_strength,
 		save_path=args.output,
-		fps=args.fps
+		fps=args.fps,
+		use_onnx=use_onnx  # Enable ONNX/TensorRT if available
 	)
 
 
