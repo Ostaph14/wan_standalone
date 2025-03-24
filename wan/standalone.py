@@ -24,7 +24,7 @@ from accelerate.utils import set_module_tensor_to_device
 torch.set_num_threads(os.cpu_count())
 os.environ["OMP_NUM_THREADS"] = str(os.cpu_count())
 os.environ["MKL_NUM_THREADS"] = str(os.cpu_count())
-
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Custom FP8 optimization implementation matching ComfyUI approach
 def fp8_linear_forward_custom(cls, original_dtype, input):
@@ -856,11 +856,12 @@ class WanVideoGenerator:
 				use_dynamic_shifting=True,
 				algorithm_type=algorithm_type,
 				solver_order=2)  # Higher order solver for better quality
-			sampling_sigmas = get_sampling_sigmas(steps, shift, mu=shift)
+			sampling_sigmas = get_sampling_sigmas(steps, shift)
 			timesteps, _ = retrieve_timesteps(
 				sample_scheduler,
 				device=self.device,
-				sigmas=sampling_sigmas)
+				sigmas=sampling_sigmas,
+				mu=shift)
 
 		else:
 			raise NotImplementedError(f"Unsupported scheduler: {scheduler}")
@@ -956,7 +957,7 @@ class WanVideoGenerator:
 			# Use block swapping (loads only necessary blocks during inference)
 			#swap_blocks = model_info["block_swap_args"]["blocks_to_swap"]
 			#print(f"Swapping blocks with parameter: {swap_blocks}")
-
+			pass
 			# The actual block swapping call
 			#transformer.block_swap(swap_blocks - 1)
 		else:
