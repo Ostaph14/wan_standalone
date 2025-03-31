@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
 
-from .attention import flash_attention
+from .attention import attention
 from .tokenizers import HuggingfaceTokenizer
 from .xlm_roberta import XLMRoberta
 
@@ -17,7 +17,10 @@ __all__ = [
     'clip_xlm_roberta_vit_h_14',
     'CLIPModel',
 ]
+from accelerate import init_empty_weights
+from accelerate.utils import set_module_tensor_to_device
 
+import comfy.model_management as mm
 
 def pos_interpolate(pos, seq_len):
     if pos.size(1) == seq_len:
@@ -82,7 +85,7 @@ class SelfAttention(nn.Module):
 
         # compute attention
         p = self.attn_dropout if self.training else 0.0
-        x = flash_attention(q, k, v, dropout_p=p, causal=self.causal, version=2)
+        x = attention(q, k, v, dropout_p=p, causal=self.causal, attention_mode="sdpa")
         x = x.reshape(b, s, c)
 
         # output
@@ -390,17 +393,17 @@ class XLMRobertaCLIP(nn.Module):
             proj_dropout=proj_dropout,
             embedding_dropout=embedding_dropout,
             norm_eps=norm_eps)
-        self.textual = XLMRobertaWithHead(
-            vocab_size=vocab_size,
-            max_seq_len=max_text_len,
-            type_size=type_size,
-            pad_id=pad_id,
-            dim=text_dim,
-            out_dim=embed_dim,
-            num_heads=text_heads,
-            num_layers=text_layers,
-            post_norm=text_post_norm,
-            dropout=text_dropout)
+        # self.textual = XLMRobertaWithHead(
+        #     vocab_size=vocab_size,
+        #     max_seq_len=max_text_len,
+        #     type_size=type_size,
+        #     pad_id=pad_id,
+        #     dim=text_dim,
+        #     out_dim=embed_dim,
+        #     num_heads=text_heads,
+        #     num_layers=text_layers,
+        #     post_norm=text_post_norm,
+        #     dropout=text_dropout)
         self.log_scale = nn.Parameter(math.log(1 / 0.07) * torch.ones([]))
 
     def forward(self, imgs, txt_ids):
@@ -445,7 +448,7 @@ def _clip(pretrained=False,
         model = model_cls(**kwargs)
 
     # set device
-    model = model.to(dtype=dtype, device=device)
+    #model = model.to(dtype=dtype, device=device)
     output = (model,)
 
     # init transforms
@@ -500,23 +503,25 @@ def clip_xlm_roberta_vit_h_14(
 
 class CLIPModel:
 
-    def __init__(self, dtype, device, checkpoint_path, tokenizer_path):
+    def __init__(self, dtype, device, state_dict, tokenizer_path):
         self.dtype = dtype
         self.device = device
-        self.checkpoint_path = checkpoint_path
         self.tokenizer_path = tokenizer_path
 
         # init model
-        self.model, self.transforms = clip_xlm_roberta_vit_h_14(
-            pretrained=False,
-            return_transforms=True,
-            return_tokenizer=False,
-            dtype=dtype,
-            device=device)
-        self.model = self.model.eval().requires_grad_(False)
-        logging.info(f'loading {checkpoint_path}')
-        self.model.load_state_dict(
-            torch.load(checkpoint_path, map_location='cpu'))
+        with init_empty_weights():
+            self.model, self.transforms = clip_xlm_roberta_vit_h_14(
+                pretrained=False,
+                return_transforms=True,
+                return_tokenizer=False,
+                dtype=dtype,
+                device=device
+                )
+            self.model = self.model.eval().requires_grad_(False)
+
+        for name, param in self.model.named_parameters():
+            set_module_tensor_to_device(self.model, name, device=device, dtype=dtype, value=state_dict[name])
+        #self.model.load_state_dict(state_dict)
 
         # init tokenizer
         self.tokenizer = HuggingfaceTokenizer(
@@ -524,19 +529,8 @@ class CLIPModel:
             seq_len=self.model.max_text_len - 2,
             clean='whitespace')
 
-    def visual(self, videos):
-        # preprocess
-        size = (self.model.image_size,) * 2
-        videos = torch.cat([
-            F.interpolate(
-                u.transpose(0, 1),
-                size=size,
-                mode='bicubic',
-                align_corners=False) for u in videos
-        ])
-        videos = self.transforms.transforms[-1](videos.mul_(0.5).add_(0.5))
-
+    def visual(self, image):
         # forward
-        with torch.cuda.amp.autocast(dtype=self.dtype):
-            out = self.model.visual(videos, use_31_block=True)
+        with torch.autocast(device_type=mm.get_autocast_device(self.device), dtype=self.dtype):
+            out = self.model.visual(image, use_31_block=True)
             return out
