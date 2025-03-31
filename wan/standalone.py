@@ -1,4 +1,3 @@
-import logging
 import os
 import torch
 import gc
@@ -9,6 +8,23 @@ import argparse
 from PIL import Image
 import glob
 from safetensors.torch import load_file
+
+import sys
+
+print(sys.path)
+try:
+	import flash_attn
+
+	print("Flash Attention 2 is available")
+except ImportError:
+	print("Flash Attention 2 is not available")
+
+try:
+	import flash_attn_interface
+
+	print("Flash Attention 3 is available")
+except ImportError:
+	print("Flash Attention 3 is not available")
 
 # Import the WanVideo modules
 from wanvideo.modules.clip import CLIPModel
@@ -26,9 +42,7 @@ torch.set_num_threads(os.cpu_count())
 os.environ["OMP_NUM_THREADS"] = str(os.cpu_count())
 os.environ["MKL_NUM_THREADS"] = str(os.cpu_count())
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:32,expandable_segments:True"
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 # Custom FP8 optimization implementation matching ComfyUI approach
 def fp8_linear_forward_custom(cls, original_dtype, input):
 	"""
@@ -153,7 +167,7 @@ class WanVideoGenerator:
         Returns:
             dict: Loaded model and configuration
         """
-		logging.info(f"Loading model from {model_path}...")
+		print(f"Loading model from {model_path}...")
 		soft_empty_cache()
 
 		# Set up devices and precision
@@ -180,7 +194,7 @@ class WanVideoGenerator:
 		num_heads = 40 if dim == 5120 else 12
 		num_layers = 40 if dim == 5120 else 30
 
-		logging.info(f"Model type: {model_type}, dim: {dim}, heads: {num_heads}, layers: {num_layers}")
+		print(f"Model type: {model_type}, dim: {dim}, heads: {num_heads}, layers: {num_layers}")
 
 		# Configure the transformer model
 		TRANSFORMER_CONFIG = {
@@ -204,16 +218,11 @@ class WanVideoGenerator:
 			transformer = WanModel(**TRANSFORMER_CONFIG)
 		transformer.eval()
 
-		# Use memory-efficient attention if available
-		if attention_mode == "sdpa" and hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
-			logging.info("Using memory-efficient attention")
-			torch.backends.cuda.enable_mem_efficient_sdp(True)
-			torch.backends.cuda.enable_flash_sdp(True)
 		# Load weights
 		manual_offloading = True
 
 		if not "torchao" in quantization:
-			logging.info("Loading model weights to device...")
+			print("Loading model weights to device...")
 
 			# Use fp16 for loading when using fp8 emulation
 			dtype = torch.float16 if quantization in ["fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_scaled"] else base_dtype
@@ -245,10 +254,10 @@ class WanVideoGenerator:
 		if blocks_to_swap > 0:
 			# This was commented out in the original code, causing it to always use default swapping
 			block_swap_args = {"blocks_to_swap": blocks_to_swap}
-			logging.info(f"Using block swapping with {blocks_to_swap} blocks")
+			print(f"Using block swapping with {blocks_to_swap} blocks")
 		else:
 			block_swap_args = None
-			logging.info("Block swapping disabled")
+			print("Block swapping disabled")
 
 		model_info = {
 			"model": transformer,
@@ -267,18 +276,18 @@ class WanVideoGenerator:
 
 		# Apply our custom FP8 optimization
 		if quantization in ["fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_scaled"]:
-			logging.info("Applying custom FP8 optimization to linear layers...")
+			print("Applying custom FP8 optimization to linear layers...")
 			params_to_keep = {"norm", "head", "bias", "time_in", "vector_in", "patch_embedding", "time_", "img_emb",
 			                  "modulation"}
 			convert_fp8_linear(transformer, base_dtype, params_to_keep=params_to_keep)
-			logging.info("FP8 optimization applied.")
+			print("FP8 optimization applied.")
 
 		self.loaded_models["diffusion_model"] = model_info
 		return model_info
 
 	def load_vae(self, vae_path, precision="bf16"):
 		"""Load the WanVideo VAE model."""
-		logging.info(f"Loading VAE from {vae_path}...")
+		print(f"Loading VAE from {vae_path}...")
 
 		dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
 		vae_sd = load_torch_file(vae_path)
@@ -299,7 +308,7 @@ class WanVideoGenerator:
 
 	def load_t5_encoder(self, t5_path, precision="bf16", load_device="offload_device", quantization="disabled"):
 		"""Load the T5 text encoder."""
-		logging.info(f"Loading T5 encoder from {t5_path}...")
+		print(f"Loading T5 encoder from {t5_path}...")
 
 		text_encoder_load_device = self.device if load_device == "main_device" else self.offload_device
 		dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
@@ -325,7 +334,7 @@ class WanVideoGenerator:
 
 	def load_clip_encoder(self, clip_path, precision="fp16", load_device="offload_device"):
 		"""Load the CLIP text/image encoder."""
-		logging.info(f"Loading CLIP encoder from {clip_path}...")
+		print(f"Loading CLIP encoder from {clip_path}...")
 
 		text_encoder_load_device = self.device if load_device == "main_device" else self.offload_device
 		dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[precision]
@@ -346,7 +355,7 @@ class WanVideoGenerator:
 
 	def encode_text(self, t5_encoder, positive_prompt, negative_prompt, force_offload=True):
 		"""Encode text prompts using the T5 encoder."""
-		logging.info(f"Encoding prompts:\nPositive: {positive_prompt}\nNegative: {negative_prompt}")
+		print(f"Encoding prompts:\nPositive: {positive_prompt}\nNegative: {negative_prompt}")
 
 		encoder = t5_encoder["model"]
 		dtype = t5_encoder["dtype"]
@@ -374,7 +383,7 @@ class WanVideoGenerator:
 	def encode_image_clip(self, clip, vae, image, num_frames, generation_width, generation_height,
 	                      force_offload=True, noise_aug_strength=0.0, latent_strength=1.0, clip_embed_strength=1.0):
 		"""Encode an image using CLIP and prepare it for I2V processing."""
-		logging.info(f"Encoding input image with CLIP, generating {num_frames} frames...")
+		print(f"Encoding input image with CLIP, generating {num_frames} frames...")
 
 		# CLIP mean and std values
 		image_mean = [0.48145466, 0.4578275, 0.40821073]
@@ -544,7 +553,7 @@ class WanVideoGenerator:
 
 	def create_empty_embeds(self, width, height, num_frames):
 		"""Create empty embeds for T2V models."""
-		logging.info(f"Creating empty embeds for {num_frames} frames at {width}x{height}...")
+		print(f"Creating empty embeds for {num_frames} frames at {width}x{height}...")
 
 		patch_size = (1, 2, 2)
 		vae_stride = (4, 8, 8)
@@ -623,8 +632,8 @@ class WanVideoGenerator:
 		"""
 		Generate a video using the WanVideo model.
 		"""
-		logging.info(f"Generating video...")
-		logging.info(f"Prompt: {positive_prompt}")
+		print(f"Generating video...")
+		print(f"Prompt: {positive_prompt}")
 
 		# IMPORTANT FIX: Adjust num_frames to satisfy the model's requirement
 		# For the mask reshaping to work, (3 + num_frames) must be divisible by 4
@@ -634,7 +643,7 @@ class WanVideoGenerator:
 			num_frames += 1
 
 		if original_num_frames != num_frames:
-			logging.info(
+			print(
 				f"Adjusted num_frames from {original_num_frames} to {num_frames} to ensure compatibility with the model")
 
 		# Find models if not explicitly provided
@@ -688,7 +697,7 @@ class WanVideoGenerator:
 		# ...
 
 		# 1. Load all required models
-		logging.info("Loading models...")
+		print("Loading models...")
 		model_info = self.load_model(
 			model_path=model_path,
 			base_precision=base_precision,
@@ -747,6 +756,7 @@ class WanVideoGenerator:
 				height=height,
 				num_frames=num_frames
 			)
+
 		# 4. Run the sampler
 		samples = self.sample(
 			model_info=model_info,
@@ -774,20 +784,20 @@ class WanVideoGenerator:
 			tile_stride_y=tile_stride_y
 		)
 
-		logging.info(f"Video generated successfully! Shape: {video_frames.shape}")
+		print(f"Video generated successfully! Shape: {video_frames.shape}")
 
 		# If original_num_frames is different from adjusted num_frames, trim the extra frames
 		if original_num_frames != num_frames and video_frames.shape[0] > original_num_frames:
 			video_frames = video_frames[:original_num_frames]
-			logging.info(f"Trimmed output to requested {original_num_frames} frames")
+			print(f"Trimmed output to requested {original_num_frames} frames")
 
 		# Save video if path is provided
 		if save_path:
 			try:
 				self.save_video(video_frames, save_path, fps=fps, format=output_format)
-				logging.info(f"Video saved to {save_path}")
+				print(f"Video saved to {save_path}")
 			except Exception as e:
-				logging.info(f"Error saving video: {e}")
+				print(f"Error saving video: {e}")
 
 		return video_frames
 
@@ -796,7 +806,7 @@ class WanVideoGenerator:
 		Fix device consistency issues while managing blocks
 		"""
 		total_blocks = len(transformer.blocks)
-		logging.info(f"Direct block management: keeping {blocks_to_keep}/{total_blocks} blocks on GPU")
+		print(f"Direct block management: keeping {blocks_to_keep}/{total_blocks} blocks on GPU")
 
 		# IMPORTANT: First move the entire model to GPU
 		# This ensures all non-block parameters are on GPU
@@ -809,7 +819,7 @@ class WanVideoGenerator:
 		# Print memory usage
 		if torch.cuda.is_available():
 			mem_allocated = torch.cuda.memory_allocated() / (1024 ** 3)
-			logging.info(f"GPU memory after block management: {mem_allocated:.2f} GB")
+			print(f"GPU memory after block management: {mem_allocated:.2f} GB")
 
 		return transformer
 
@@ -819,13 +829,13 @@ class WanVideoGenerator:
 		"""
 		Run the sampling process to generate the video.
 		"""
-		logging.info(f"Running sampling for {steps} steps with {scheduler} scheduler...")
+		print(f"Running sampling for {steps} steps with {scheduler} scheduler...")
 
 		# FIXED: Make sure seed is always a valid integer
 		if seed is None or not isinstance(seed, int):
 			seed = int(torch.randint(0, 2147483647, (1,)).item())
 
-		logging.info(f"Using seed: {seed}")
+		print(f"Using seed: {seed}")
 
 		transformer = model_info["model"]
 
@@ -942,10 +952,6 @@ class WanVideoGenerator:
 			'device': self.device,
 			'freqs': freqs.to(self.device),
 		}
-		# Optimize memory for image embeddings
-		if transformer.model_type == "i2v" and base_args['clip_fea'] is not None:
-			# Convert to fp16 temporarily to save memory
-			base_args['clip_fea'] = base_args['clip_fea'].to(dtype=torch.float16)
 
 		if transformer.model_type == "i2v":
 			base_args.update({
@@ -967,7 +973,7 @@ class WanVideoGenerator:
 
 			# Use block swapping (loads only necessary blocks during inference)
 			#swap_blocks = model_info["block_swap_args"]["blocks_to_swap"]
-			#logging.info(f"Swapping blocks with parameter: {swap_blocks}")
+			#print(f"Swapping blocks with parameter: {swap_blocks}")
 			pass
 			# The actual block swapping call
 			#transformer.block_swap(swap_blocks - 1)
@@ -1048,7 +1054,7 @@ class WanVideoGenerator:
 	def decode(self, vae, samples, enable_vae_tiling=True,
 	           tile_x=272, tile_y=272, tile_stride_x=144, tile_stride_y=128):
 		"""Decode latents into video frames."""
-		logging.info("Decoding video frames...")
+		print("Decoding video frames...")
 
 		soft_empty_cache()
 		latents = samples["samples"]
@@ -1058,7 +1064,7 @@ class WanVideoGenerator:
 
 		# Move latents to device
 		latents = latents.to(device=self.device, dtype=vae.dtype)
-		torch.cuda.set_sync_debug_mode(0)  # Disable synchronization checking
+
 		# Use mixed precision for decoding to save memory
 		with torch.cuda.amp.autocast():
 			# Decode in tiles for memory efficiency
@@ -1143,8 +1149,8 @@ class WanVideoGenerator:
 		"""
 		Generate a video using the WanVideo model.
 		"""
-		logging.info(f"Generating video...")
-		logging.info(f"Prompt: {positive_prompt}")
+		print(f"Generating video...")
+		print(f"Prompt: {positive_prompt}")
 
 		# IMPORTANT FIX: Adjust num_frames to satisfy the model's requirement
 		# For the mask reshaping to work, (3 + num_frames) must be divisible by 4
@@ -1154,7 +1160,7 @@ class WanVideoGenerator:
 			num_frames += 1
 
 		if original_num_frames != num_frames:
-			logging.info(
+			print(
 				f"Adjusted num_frames from {original_num_frames} to {num_frames} to ensure compatibility with the model")
 
 		# Find models if not explicitly provided
@@ -1208,7 +1214,7 @@ class WanVideoGenerator:
 		# ...
 
 		# 1. Load all required models
-		logging.info("Loading models...")
+		print("Loading models...")
 		model_info = self.load_model(
 			model_path=model_path,
 			base_precision=base_precision,
@@ -1267,6 +1273,7 @@ class WanVideoGenerator:
 				height=height,
 				num_frames=num_frames
 			)
+
 		# 4. Run the sampler
 		samples = self.sample(
 			model_info=model_info,
@@ -1294,20 +1301,20 @@ class WanVideoGenerator:
 			tile_stride_y=tile_stride_y
 		)
 
-		logging.info(f"Video generated successfully! Shape: {video_frames.shape}")
+		print(f"Video generated successfully! Shape: {video_frames.shape}")
 
 		# If original_num_frames is different from adjusted num_frames, trim the extra frames
 		if original_num_frames != num_frames and video_frames.shape[0] > original_num_frames:
 			video_frames = video_frames[:original_num_frames]
-			logging.info(f"Trimmed output to requested {original_num_frames} frames")
+			print(f"Trimmed output to requested {original_num_frames} frames")
 
 		# Save video if path is provided
 		if save_path:
 			try:
 				self.save_video(video_frames, save_path, fps=fps, format=output_format)
-				logging.info(f"Video saved to {save_path}")
+				print(f"Video saved to {save_path}")
 			except Exception as e:
-				logging.info(f"Error saving video: {e}")
+				print(f"Error saving video: {e}")
 
 		return video_frames
 
@@ -1332,7 +1339,7 @@ class WanVideoGenerator:
 			else:
 				raise ValueError(f"Unsupported format: {format}")
 		except ImportError:
-			logging.info("Please install imageio for video saving: pip install imageio imageio-ffmpeg")
+			print("Please install imageio for video saving: pip install imageio imageio-ffmpeg")
 			# Fall back to saving frames
 			dir_path = os.path.splitext(save_path)[0] + "_frames"
 			os.makedirs(dir_path, exist_ok=True)
@@ -1375,7 +1382,7 @@ def main():
 	torch.cuda.empty_cache()
 	gc.collect()
 
-	logging.info(f"Initial VRAM: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
+	print(f"Initial VRAM: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
 
 	# Create generator with explicit device
 	generator = WanVideoGenerator(
@@ -1399,7 +1406,7 @@ def main():
 		t5_precision="bf16",
 		clip_precision="fp16",
 		quantization="fp8_e4m3fn",  # Use our custom FP8 implementation
-		attention_mode="sdpa",
+		attention_mode="flash_attn_2",
 		blocks_to_swap=args.blocks_to_swap,
 		positive_prompt=args.positive_prompt,
 		negative_prompt=args.negative_prompt,
