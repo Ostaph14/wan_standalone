@@ -1348,6 +1348,12 @@ class WanVideoGenerator:
 				img.save(os.path.join(dir_path, f"frame_{i:05d}.png"))
 
 
+import argparse
+
+# Create a global generator to be reused between runs
+_GLOBAL_GENERATORS = {}
+
+
 def main():
 	parser = argparse.ArgumentParser(description="Generate videos with WanVideo models")
 	parser.add_argument("--models_dir", type=str, required=True, help="Directory with model files")
@@ -1369,61 +1375,116 @@ def main():
 	parser.add_argument("--noise_aug_strength", type=float, default=0.0, help="Noise augmentation strength for I2V")
 	parser.add_argument("--output", type=str, required=True, help="Output path for the video")
 	parser.add_argument("--fps", type=int, default=16, help="Frames per second for output video")
+	# New arguments for model reuse
+	parser.add_argument("--keep_loaded", action="store_true", help="Keep models loaded after generation")
+	parser.add_argument("--reload", action="store_true", help="Force reload models even if cached")
 
 	args = parser.parse_args()
 
-	# Specify paths to match ComfyUI workflow
-	model_path = os.path.join(args.models_dir, "Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors")
+	# If this is just a cleanup call with --reload, we can skip generation
+	if args.reload and args.positive_prompt == "cleanup":
+		print(f"Cleaning up models on {args.device}")
+		if args.device in _GLOBAL_GENERATORS:
+			del _GLOBAL_GENERATORS[args.device]
+		# Force garbage collection
+		gc.collect()
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
+		return
+
+	# Clear CUDA cache before starting if needed
+	if args.reload or args.device not in _GLOBAL_GENERATORS:
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
+		gc.collect()
+
+	# Get or create generator
+	if args.reload or args.device not in _GLOBAL_GENERATORS:
+		print(f"Creating new WanVideoGenerator for {args.device}")
+		_GLOBAL_GENERATORS[args.device] = WanVideoGenerator(
+			models_dir=args.models_dir,
+			device=args.device
+		)
+	else:
+		print(f"Reusing existing WanVideoGenerator for {args.device}")
+
+	generator = _GLOBAL_GENERATORS[args.device]
+
+	# Specify paths
+	model_path = None
+	if args.input_image:
+		# Use I2V model
+		model_path = os.path.join(args.models_dir, "Wan2_1-I2V-14B-480P_fp8_e4m3fn.safetensors")
+	else:
+		# Use T2V model
+		model_path = os.path.join(args.models_dir, "Wan2_1-T2V-14B-480P_fp8_e4m3fn.safetensors")
+
 	vae_path = os.path.join(args.models_dir, "vae", "Wan2_1_VAE_fp32.safetensors")
 	t5_path = os.path.join(args.models_dir, "text_encoders", "umt5-xxl-enc-fp8_e4m3fn.safetensors")
 	clip_path = os.path.join(args.models_dir, "clip", "open-clip-xlm-roberta-large-vit-huge-14_fp16.safetensors")
-
-	# Clear CUDA cache before starting
-	torch.cuda.empty_cache()
-	gc.collect()
-
-	print(f"Initial VRAM: {torch.cuda.memory_allocated() / 1024 ** 3:.2f} GB")
-
-	# Create generator with explicit device
-	generator = WanVideoGenerator(
-		models_dir=args.models_dir,
-		device=args.device
-	)
 
 	# Load input image if provided
 	input_img = None
 	if args.input_image:
 		input_img = Image.open(args.input_image).convert("RGB")
 
-	# Generate video with our custom FP8 implementation
-	generator.generate_video(
-		model_path=model_path,
-		vae_path=vae_path,
-		t5_path=t5_path,
-		clip_path=clip_path,
-		base_precision="fp16",  # Use fp16 for base precision
-		vae_precision="bf16",
-		t5_precision="bf16",
-		clip_precision="fp16",
-		quantization="fp8_e4m3fn",  # Use our custom FP8 implementation
-		attention_mode="flash_attn_2",
-		blocks_to_swap=args.blocks_to_swap,
-		positive_prompt=args.positive_prompt,
-		negative_prompt=args.negative_prompt,
-		width=args.width,
-		height=args.height,
-		num_frames=args.num_frames,
-		steps=args.steps,
-		cfg=args.cfg,
-		shift=args.shift,
-		seed=args.seed,
-		scheduler=args.scheduler,
-		force_offload=True,  # Always offload models to CPU when not in use
-		input_image=input_img,
-		noise_aug_strength=args.noise_aug_strength,
-		save_path=args.output,
-		fps=args.fps
-	)
+	# Generate video
+	try:
+		print(f"Initial VRAM: {torch.cuda.memory_allocated(args.device) / 1024 ** 3:.2f} GB")
+		video_frames = generator.generate_video(
+			model_path=model_path,
+			vae_path=vae_path,
+			t5_path=t5_path,
+			clip_path=clip_path,
+			base_precision="fp16",
+			vae_precision="bf16",
+			t5_precision="bf16",
+			clip_precision="fp16",
+			quantization="fp8_e4m3fn",
+			attention_mode="sdpa",
+			blocks_to_swap=args.blocks_to_swap,
+			positive_prompt=args.positive_prompt,
+			negative_prompt=args.negative_prompt,
+			width=args.width,
+			height=args.height,
+			num_frames=args.num_frames,
+			steps=args.steps,
+			cfg=args.cfg,
+			shift=args.shift,
+			seed=args.seed,
+			scheduler=args.scheduler,
+			force_offload=not args.keep_loaded,  # Only keep loaded if requested
+			input_image=input_img,
+			noise_aug_strength=args.noise_aug_strength,
+			save_path=args.output,
+			fps=args.fps
+		)
+		print(f"Video generation complete. Output saved to {args.output}")
+
+		if not args.keep_loaded:
+			print("Cleaning up models to save memory")
+			# Don't delete the generator, just clear the loaded models
+			if args.device in _GLOBAL_GENERATORS:
+				_GLOBAL_GENERATORS[args.device].loaded_models = {}
+			# Force garbage collection
+			gc.collect()
+			if torch.cuda.is_available():
+				torch.cuda.empty_cache()
+		else:
+			print(f"Models kept loaded for {args.device} for future use")
+
+		print(f"Final VRAM: {torch.cuda.memory_allocated(args.device) / 1024 ** 3:.2f} GB")
+
+	except Exception as e:
+		print(f"Error generating video: {e}")
+		# In case of error, clean up immediately
+		if args.device in _GLOBAL_GENERATORS:
+			del _GLOBAL_GENERATORS[args.device]
+		gc.collect()
+		if torch.cuda.is_available():
+			torch.cuda.empty_cache()
+		# Return error code
+		sys.exit(1)
 
 
 if __name__ == "__main__":
