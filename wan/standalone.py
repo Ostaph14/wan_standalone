@@ -1053,8 +1053,8 @@ class WanVideoGenerator:
 
 	def decode(self, vae, samples, enable_vae_tiling=True,
 	           tile_x=416, tile_y=480, tile_stride_x=208, tile_stride_y=240):
-		"""Decode latents into video frames."""
-		print("Decoding video frames...")
+		"""Decode latents into video frames with enhanced quality."""
+		print("Decoding video frames with quality enhancement...")
 
 		soft_empty_cache()
 		latents = samples["samples"]
@@ -1081,12 +1081,66 @@ class WanVideoGenerator:
 		vae.model.clear_cache()
 		soft_empty_cache()
 
-		# Normalize and format
-		image = (image - image.min()) / (image.max() - image.min() + 1e-8)  # Add small epsilon for better precision
-		image = torch.clamp(image, 0.0, 1.0)
-		image = image.permute(1, 2, 3, 0).cpu().float()
+		# Apply post-processing to enhance details
+		# Convert to CPU for memory efficiency during post-processing
+		image_cpu = image.cpu()
 
-		return image
+		# Normalize before sharpening
+		img_min = image_cpu.min()
+		img_max = image_cpu.max()
+		normalized = (image_cpu - img_min) / (img_max - img_min + 1e-8)
+
+		# Apply sharpening filter - move back to GPU if there's enough memory
+		try:
+			# Try to do this on GPU for speed
+			sharpened = normalized.to(self.device)
+
+			# Create Gaussian blur kernel
+			kernel_size = 3
+			sigma = 0.5
+			channels = sharpened.shape[0]
+
+			# Apply sharpening via unsharp mask using a convolution-based approach
+			# First create a smoother version
+			padding = kernel_size // 2
+			smoothed = torch.nn.functional.avg_pool2d(
+				sharpened.view(-1, 1, sharpened.shape[2], sharpened.shape[3]),
+				kernel_size=kernel_size,
+				stride=1,
+				padding=padding
+			).view(sharpened.shape)
+
+			# Apply unsharp mask: enhanced = original + (original - blurred) * amount
+			amount = 0.5  # Strength of sharpening (0.5 = moderate, 1.0 = strong)
+			enhanced = sharpened + (sharpened - smoothed) * amount
+
+			# Ensure values remain in [0,1] range
+			enhanced = torch.clamp(enhanced, 0, 1)
+
+			# Move back to CPU
+			enhanced = enhanced.cpu()
+		except RuntimeError:
+			# Fallback to CPU if not enough VRAM
+			print("Using CPU for sharpening filter...")
+
+			# Simple sharpening using numpy operations (less memory intensive)
+			# Create blurred version using average pooling
+			smoothed = torch.nn.functional.avg_pool2d(
+				normalized.view(-1, 1, normalized.shape[2], normalized.shape[3]),
+				kernel_size=3,
+				stride=1,
+				padding=1
+			).view(normalized.shape)
+
+			# Apply unsharp mask
+			amount = 0.5
+			enhanced = normalized + (normalized - smoothed) * amount
+			enhanced = torch.clamp(enhanced, 0, 1)
+
+		# Format the final result
+		enhanced = enhanced.permute(1, 2, 3, 0).float()
+
+		return enhanced
 
 	def generate_video(self,
 	                   # Model parameters
@@ -1429,62 +1483,51 @@ def main():
 		input_img = Image.open(args.input_image).convert("RGB")
 
 	# Generate video
-	try:
-		print(f"Initial VRAM: {torch.cuda.memory_allocated(args.device) / 1024 ** 3:.2f} GB")
-		video_frames = generator.generate_video(
-			model_path=model_path,
-			vae_path=vae_path,
-			t5_path=t5_path,
-			clip_path=clip_path,
-			base_precision="bf16",
-			vae_precision="fp32",
-			t5_precision="bf16",
-			clip_precision="fp16",
-			quantization="fp8_e4m3fn",
-			attention_mode="sdpa",
-			blocks_to_swap=args.blocks_to_swap,
-			positive_prompt=args.positive_prompt,
-			negative_prompt=args.negative_prompt,
-			width=args.width,
-			height=args.height,
-			num_frames=args.num_frames,
-			steps=args.steps,
-			cfg=args.cfg,
-			shift=args.shift,
-			seed=args.seed,
-			scheduler=args.scheduler,
-			force_offload=not args.keep_loaded,  # Only keep loaded if requested
-			input_image=input_img,
-			noise_aug_strength=args.noise_aug_strength,
-			save_path=args.output,
-			fps=args.fps
-		)
-		print(f"Video generation complete. Output saved to {args.output}")
+	print(f"Initial VRAM: {torch.cuda.memory_allocated(args.device) / 1024 ** 3:.2f} GB")
+	video_frames = generator.generate_video(
+		model_path=model_path,
+		vae_path=vae_path,
+		t5_path=t5_path,
+		clip_path=clip_path,
+		base_precision="bf16",
+		vae_precision="fp32",
+		t5_precision="bf16",
+		clip_precision="fp16",
+		quantization="fp8_e4m3fn",
+		attention_mode="sdpa",
+		blocks_to_swap=args.blocks_to_swap,
+		positive_prompt=args.positive_prompt,
+		negative_prompt=args.negative_prompt,
+		width=args.width,
+		height=args.height,
+		num_frames=args.num_frames,
+		steps=args.steps,
+		cfg=args.cfg,
+		shift=args.shift,
+		seed=args.seed,
+		scheduler=args.scheduler,
+		force_offload=not args.keep_loaded,  # Only keep loaded if requested
+		input_image=input_img,
+		noise_aug_strength=args.noise_aug_strength,
+		save_path=args.output,
+		fps=args.fps
+	)
+	print(f"Video generation complete. Output saved to {args.output}")
 
-		if not args.keep_loaded:
-			print("Cleaning up models to save memory")
-			# Don't delete the generator, just clear the loaded models
-			if args.device in _GLOBAL_GENERATORS:
-				_GLOBAL_GENERATORS[args.device].loaded_models = {}
-			# Force garbage collection
-			gc.collect()
-			if torch.cuda.is_available():
-				torch.cuda.empty_cache()
-		else:
-			print(f"Models kept loaded for {args.device} for future use")
-
-		print(f"Final VRAM: {torch.cuda.memory_allocated(args.device) / 1024 ** 3:.2f} GB")
-
-	except Exception as e:
-		print(f"Error generating video: {e}")
-		# In case of error, clean up immediately
+	if not args.keep_loaded:
+		print("Cleaning up models to save memory")
+		# Don't delete the generator, just clear the loaded models
 		if args.device in _GLOBAL_GENERATORS:
-			del _GLOBAL_GENERATORS[args.device]
+			_GLOBAL_GENERATORS[args.device].loaded_models = {}
+		# Force garbage collection
 		gc.collect()
 		if torch.cuda.is_available():
 			torch.cuda.empty_cache()
-		# Return error code
-		sys.exit(1)
+	else:
+		print(f"Models kept loaded for {args.device} for future use")
+
+	print(f"Final VRAM: {torch.cuda.memory_allocated(args.device) / 1024 ** 3:.2f} GB")
+
 
 
 if __name__ == "__main__":
