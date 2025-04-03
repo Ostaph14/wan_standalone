@@ -381,7 +381,7 @@ class WanVideoGenerator:
 		}
 
 	def encode_image_clip(self, clip, vae, image, num_frames, generation_width, generation_height,
-	                      force_offload=True, noise_aug_strength=0.0, latent_strength=1.0, clip_embed_strength=1.1):
+	                      force_offload=True, noise_aug_strength=0.01, latent_strength=1.0, clip_embed_strength=1.1):
 		"""Encode an image using CLIP and prepare it for I2V processing."""
 		print(f"Encoding input image with CLIP, generating {num_frames} frames...")
 
@@ -580,7 +580,7 @@ class WanVideoGenerator:
 
 	                   # Precision settings
 	                   base_precision="fp16",  # Use fp16 as default for better memory
-	                   vae_precision="bf16",
+	                   vae_precision="fp32",
 	                   t5_precision="bf16",
 	                   clip_precision="fp16",
 
@@ -616,7 +616,7 @@ class WanVideoGenerator:
 
 	                   # Image to Video settings
 	                   input_image=None,
-	                   noise_aug_strength=0.0,
+	                   noise_aug_strength=0.01,
 	                   latent_strength=1.0,
 	                   clip_embed_strength=1.1,
 
@@ -931,7 +931,7 @@ class WanVideoGenerator:
 
 		# Initialize latent on CPU first, then move to GPU when needed
 		latent = noise
-
+		latent = latent * 1.02 # subtle contrast enhancement
 		# Set up rope parameters
 		d = transformer.dim // transformer.num_heads
 		freqs = torch.cat([
@@ -1082,7 +1082,7 @@ class WanVideoGenerator:
 		soft_empty_cache()
 
 		# Normalize and format
-		image = (image - image.min()) / (image.max() - image.min())
+		image = (image - image.min()) / (image.max() - image.min() + 1e-8)  # Add small epsilon for better precision
 		image = torch.clamp(image, 0.0, 1.0)
 		image = image.permute(1, 2, 3, 0).cpu().float()
 
@@ -1097,7 +1097,7 @@ class WanVideoGenerator:
 
 	                   # Precision settings
 	                   base_precision="fp16",  # Use fp16 as default for better memory
-	                   vae_precision="bf16",
+	                   vae_precision="fp32",
 	                   t5_precision="bf16",
 	                   clip_precision="fp16",
 
@@ -1133,7 +1133,7 @@ class WanVideoGenerator:
 
 	                   # Image to Video settings
 	                   input_image=None,
-	                   noise_aug_strength=0.0,
+	                   noise_aug_strength=0.01,
 	                   latent_strength=1.0,
 	                   clip_embed_strength=1.1,
 
@@ -1372,7 +1372,7 @@ def main():
 	                    help="Sampling scheduler")
 	parser.add_argument("--blocks_to_swap", type=int, default=30, help="Number of blocks to swap to CPU to save VRAM")
 	parser.add_argument("--input_image", type=str, default=None, help="Optional input image for I2V")
-	parser.add_argument("--noise_aug_strength", type=float, default=0.0, help="Noise augmentation strength for I2V")
+	parser.add_argument("--noise_aug_strength", type=float, default=0.01, help="Noise augmentation strength for I2V")
 	parser.add_argument("--output", type=str, required=True, help="Output path for the video")
 	parser.add_argument("--fps", type=int, default=16, help="Frames per second for output video")
 	# New arguments for model reuse
@@ -1437,7 +1437,7 @@ def main():
 			t5_path=t5_path,
 			clip_path=clip_path,
 			base_precision="bf16",
-			vae_precision="bf16",
+			vae_precision="fp32",
 			t5_precision="bf16",
 			clip_precision="fp16",
 			quantization="fp8_e4m3fn",
