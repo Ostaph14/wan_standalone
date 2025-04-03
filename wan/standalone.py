@@ -381,7 +381,7 @@ class WanVideoGenerator:
 		}
 
 	def encode_image_clip(self, clip, vae, image, num_frames, generation_width, generation_height,
-	                      force_offload=True, noise_aug_strength=0.0, latent_strength=1.0, clip_embed_strength=1.0):
+	                      force_offload=True, noise_aug_strength=0.0, latent_strength=1.0, clip_embed_strength=1.1):
 		"""Encode an image using CLIP and prepare it for I2V processing."""
 		print(f"Encoding input image with CLIP, generating {num_frames} frames...")
 
@@ -609,16 +609,16 @@ class WanVideoGenerator:
 
 	                   # VAE settings
 	                   enable_vae_tiling=True,
-	                   tile_x=272,
-	                   tile_y=272,
-	                   tile_stride_x=144,
-	                   tile_stride_y=128,
+	                   tile_x=416,  # Half the width (832/2)
+	                   tile_y=480,  # Full height
+	                   tile_stride_x=208,  # 50% overlap for width
+	                   tile_stride_y=240,  # 50% overlap for height
 
 	                   # Image to Video settings
 	                   input_image=None,
 	                   noise_aug_strength=0.0,
 	                   latent_strength=1.0,
-	                   clip_embed_strength=1.0,
+	                   clip_embed_strength=1.1,
 
 	                   # Video to Video settings
 	                   input_video=None,
@@ -872,7 +872,7 @@ class WanVideoGenerator:
 				shift=shift,
 				use_dynamic_shifting=True,
 				algorithm_type=algorithm_type,
-				solver_order=2)  # Higher order solver for better quality
+				solver_order=3)  # Higher order solver for better quality
 			sampling_sigmas = get_sampling_sigmas(steps, shift)
 			timesteps, _ = retrieve_timesteps(
 				sample_scheduler,
@@ -1052,7 +1052,7 @@ class WanVideoGenerator:
 		return {"samples": result}
 
 	def decode(self, vae, samples, enable_vae_tiling=True,
-	           tile_x=272, tile_y=272, tile_stride_x=144, tile_stride_y=128):
+	           tile_x=416, tile_y=480, tile_stride_x=208, tile_stride_y=240):
 		"""Decode latents into video frames."""
 		print("Decoding video frames...")
 
@@ -1126,16 +1126,16 @@ class WanVideoGenerator:
 
 	                   # VAE settings
 	                   enable_vae_tiling=True,
-	                   tile_x=272,
-	                   tile_y=272,
-	                   tile_stride_x=144,
-	                   tile_stride_y=128,
+	                   tile_x=416,  # Half the width (832/2)
+	                   tile_y=480,  # Full height
+	                   tile_stride_x=208,  # 50% overlap for width
+	                   tile_stride_y=240,  # 50% overlap for height
 
 	                   # Image to Video settings
 	                   input_image=None,
 	                   noise_aug_strength=0.0,
 	                   latent_strength=1.0,
-	                   clip_embed_strength=1.0,
+	                   clip_embed_strength=1.1,
 
 	                   # Video to Video settings
 	                   input_video=None,
@@ -1436,7 +1436,7 @@ def main():
 			vae_path=vae_path,
 			t5_path=t5_path,
 			clip_path=clip_path,
-			base_precision="fp16",
+			base_precision="bf16",
 			vae_precision="bf16",
 			t5_precision="bf16",
 			clip_precision="fp16",
