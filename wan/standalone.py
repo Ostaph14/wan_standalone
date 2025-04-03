@@ -850,7 +850,7 @@ class WanVideoGenerator:
 		# Initialize scheduler code remains the same...
 
 		# Make sure seed_g is created after seed is properly initialized
-		seed_g = torch.Generator(device=torch.device("cpu"))
+		seed_g = torch.Generator(device=self.device)
 		seed_g.manual_seed(seed)  # Now this should work!
 
 		# Initialize scheduler
@@ -889,7 +889,7 @@ class WanVideoGenerator:
 			timesteps = timesteps[-(steps + 1):]
 
 		# Prepare initial noise
-		seed_g = torch.Generator(device=torch.device("cpu"))
+		seed_g = torch.Generator(device=self.device)
 		seed_g.manual_seed(seed)
 
 		if transformer.model_type == "i2v":
@@ -905,7 +905,7 @@ class WanVideoGenerator:
 				lat_w,
 				dtype=torch.float32,
 				generator=seed_g,
-				device=torch.device("cpu"))
+				device=self.device)
 
 			seq_len = image_embeds["max_seq_len"]
 		else:  # t2v
@@ -920,7 +920,7 @@ class WanVideoGenerator:
 				target_shape[2],
 				target_shape[3],
 				dtype=torch.float32,
-				device=torch.device("cpu"),
+				device=self.device,
 				generator=seed_g)
 
 		# Handle initial latents for video2video
